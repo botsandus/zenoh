@@ -616,6 +616,17 @@ impl GossipNet {
                 },
             );
         }
+        // PATCH (leak #2): when a peer's session closes, release its start_condition.
+        // The "happy path" termination in p2p_peer/interests.rs::declare_final only
+        // fires when the peer's INITIAL_INTEREST declare-final arrives. If the peer
+        // dies between transport-up and declare-final delivery (common under heavy
+        // discovery churn at Gazebo cold-start), the start_condition leaks and
+        // start_peer() waits the full scouting/delay on a notify that never fires.
+        if let Some(runtime) = self.runtime.upgrade() {
+            zenoh_runtime::ZRuntime::Net.block_in_place(
+                runtime.start_conditions().terminate_peer_connector_zid(*zid),
+            );
+        }
         vec![]
     }
 }
