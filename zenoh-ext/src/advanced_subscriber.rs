@@ -852,36 +852,54 @@ impl<Handler> AdvancedSubscriber<Handler> {
         tracing::debug!("Create AdvancedSubscriber{{key_expr: {}}}", key_expr,);
 
         if let Some(historyconf) = conf.history.as_ref() {
-            let handler = InitialRepliesHandler {
-                statesref: statesref.clone(),
-            };
-            let mut params = Parameters::empty();
-            if let Some(max) = historyconf.sample_depth {
-                params.insert("_max", max.to_string());
-            }
-            if let Some(age) = historyconf.age {
-                params.set_time_range(TimeRange {
-                    start: TimeBound::Inclusive(TimeExpr::Now { offset_secs: -age }),
-                    end: TimeBound::Unbounded,
-                });
-            }
-            tracing::trace!(
-                "AdvancedSubscriber{{key_expr: {}}} Querying historical samples {}?{}",
-                key_expr,
-                &key_expr / KE_ADV_PREFIX / KE_STARSTAR,
-                params
-            );
-            let _ = conf
-                .session
-                .get(Selector::from((
-                    &key_expr / KE_ADV_PREFIX / KE_STARSTAR,
-                    params,
-                )))
-                .callback({
-                    let key_expr = key_expr.clone().into_owned();
-                    move |r: Reply| {
+            // PATCH (transient_local replay race): the initial historical
+            // query is a one-shot `session.get(...)` against the publishers'
+            // AdvancedCache queryables. In a cold-start (e.g. ROS 2 bringup
+            // where ~100 sessions come up in parallel), the publisher's
+            // queryable may not yet be in this subscriber's routing table
+            // when the query fires; the query then returns zero replies
+            // and the subscriber silently misses TRANSIENT_LOCAL replay
+            // (visible as e.g. /robot_description / /tf_static never
+            // reaching a late-joining consumer). The liveliness-based
+            // late-detect path (below) has the same race for *existing*
+            // tokens via `.history(true)`. Workaround here: re-fire the
+            // initial historical query a few times with backoff, stopping
+            // as soon as any reply arrives. Duplicate samples are
+            // deduplicated by handle_sample()'s timestamp/sn bookkeeping.
+            let received_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let query_keyexpr = (&key_expr / KE_ADV_PREFIX / KE_STARSTAR).into_owned();
+
+            // Fire the initial query (preserves original behaviour).
+            {
+                let handler = InitialRepliesHandler {
+                    statesref: statesref.clone(),
+                };
+                let mut params = Parameters::empty();
+                if let Some(max) = historyconf.sample_depth {
+                    params.insert("_max", max.to_string());
+                }
+                if let Some(age) = historyconf.age {
+                    params.set_time_range(TimeRange {
+                        start: TimeBound::Inclusive(TimeExpr::Now { offset_secs: -age }),
+                        end: TimeBound::Unbounded,
+                    });
+                }
+                tracing::trace!(
+                    "AdvancedSubscriber{{key_expr: {}}} Querying historical samples {}?{}",
+                    key_expr,
+                    query_keyexpr,
+                    params
+                );
+                let received_count_cb = received_count.clone();
+                let key_expr_cb = key_expr.clone().into_owned();
+                let _ = conf
+                    .session
+                    .get(Selector::from((query_keyexpr.clone(), params)))
+                    .callback(move |r: Reply| {
                         if let Ok(s) = r.into_result() {
-                            if key_expr.intersects(s.key_expr()) {
+                            if key_expr_cb.intersects(s.key_expr()) {
+                                received_count_cb
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let states = &mut *zlock!(handler.statesref);
                                 tracing::trace!(
                                     "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
@@ -892,13 +910,75 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                 handle_sample(states, s);
                             }
                         }
+                    })
+                    .consolidation(ConsolidationMode::None)
+                    .accept_replies(ReplyKeyExpr::Any)
+                    .target(query_target)
+                    .timeout(query_timeout)
+                    .wait();
+            }
+
+            // Retry task with exponential backoff.
+            let session_weak = conf.session.downgrade();
+            let received_count_retry = received_count;
+            let statesref_retry = statesref.clone();
+            let key_expr_retry = key_expr.clone().into_owned();
+            let query_keyexpr_retry = query_keyexpr;
+            let historyconf_retry = historyconf.clone();
+            ZRuntime::Net.spawn(async move {
+                for delay_ms in [500u64, 1000, 2000, 4000] {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    if received_count_retry
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                    {
+                        tracing::trace!(
+                            "AdvancedSubscriber{{key_expr: {}}}: Historical replay received; stop retrying.",
+                            key_expr_retry
+                        );
+                        break;
                     }
-                })
-                .consolidation(ConsolidationMode::None)
-                .accept_replies(ReplyKeyExpr::Any)
-                .target(query_target)
-                .timeout(query_timeout)
-                .wait();
+                    let mut params = Parameters::empty();
+                    if let Some(max) = historyconf_retry.sample_depth {
+                        params.insert("_max", max.to_string());
+                    }
+                    if let Some(age) = historyconf_retry.age {
+                        params.set_time_range(TimeRange {
+                            start: TimeBound::Inclusive(TimeExpr::Now {
+                                offset_secs: -age,
+                            }),
+                            end: TimeBound::Unbounded,
+                        });
+                    }
+                    tracing::debug!(
+                        "AdvancedSubscriber{{key_expr: {}}}: Retrying historical query (delay={}ms)",
+                        key_expr_retry,
+                        delay_ms
+                    );
+                    let handler = InitialRepliesHandler {
+                        statesref: statesref_retry.clone(),
+                    };
+                    let received_count_cb = received_count_retry.clone();
+                    let key_expr_cb = key_expr_retry.clone();
+                    let _ = session_weak
+                        .get(Selector::from((query_keyexpr_retry.clone(), params)))
+                        .callback(move |r: Reply| {
+                            if let Ok(s) = r.into_result() {
+                                if key_expr_cb.intersects(s.key_expr()) {
+                                    received_count_cb
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let states = &mut *zlock!(handler.statesref);
+                                    handle_sample(states, s);
+                                }
+                            }
+                        })
+                        .consolidation(ConsolidationMode::None)
+                        .accept_replies(ReplyKeyExpr::Any)
+                        .target(query_target)
+                        .timeout(query_timeout)
+                        .wait();
+                }
+            });
         }
 
         let liveliness_subscriber = if let Some(historyconf) = conf.history.as_ref() {
