@@ -468,8 +468,16 @@ impl GossipNet {
                             .is_none()
                         {
                             runtime.start_conditions().add_peer_connector_zid(zid).await;
-                            if runtime.connect_peer(&zid, &locators).await
-                                && ((!wait_declares) || whatami != WhatAmI::Peer)
+                            let connected = runtime.connect_peer(&zid, &locators).await;
+                            // PATCH: always release the start_condition when the connect
+                            // fails. Without this, a stale gossip-advertised peer keeps
+                            // the session in "waiting on start_conditions" state for the
+                            // full scouting/delay, which produces silent LoadNode-service
+                            // / queryable-declaration drops in downstream consumers under
+                            // heavy peer churn (see Dexory rmw_zenoh wedge investigation).
+                            if !connected
+                                || (!wait_declares)
+                                || whatami != WhatAmI::Peer
                             {
                                 runtime
                                     .start_conditions()
