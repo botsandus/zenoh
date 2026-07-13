@@ -195,13 +195,17 @@ pub fn map_zmsg_to_partner<ShmCfg: PartnerShmConfig>(
             PushBody::Put(b) => b.map_to_partner(partner_shm_cfg, shm_provider),
             PushBody::Del(_) => {}
         },
-        NetworkBodyMut::Request(Request { payload, .. }) => match payload {
-            RequestBody::Query(b) => b.map_to_partner(partner_shm_cfg, shm_provider),
-        },
-        NetworkBodyMut::Response(Response { payload, .. }) => match payload {
-            ResponseBody::Reply(b) => b.map_to_partner(partner_shm_cfg, shm_provider),
-            ResponseBody::Err(b) => b.map_to_partner(partner_shm_cfg, shm_provider),
-        },
+        // NetworkBodyMut::Request(Request { payload, .. }) => match payload {
+        //     RequestBody::Query(b) => b.map_to_partner(partner_shm_cfg, shm_provider),
+        // },
+        // NetworkBodyMut::Response(Response { payload, .. }) => match payload {
+        //     ResponseBody::Reply(b) => b.map_to_partner(partner_shm_cfg, shm_provider),
+        //     ResponseBody::Err(b) => b.map_to_partner(partner_shm_cfg, shm_provider),
+        // },
+
+        // Workaround for https://github.com/eclipse-zenoh/zenoh/issues/2628
+        // don't promote any query/reply to SHM
+        NetworkBodyMut::Request(_)| NetworkBodyMut::Response(_) => {},
         NetworkBodyMut::ResponseFinal(_)
         | NetworkBodyMut::Interest(_)
         | NetworkBodyMut::Declare(_)
