@@ -300,16 +300,16 @@ impl HatInterestTrait for HatCode {
 
     fn declare_final(&self, tables: &mut Tables, face: &mut Arc<FaceState>, id: InterestId) {
         if id == INITIAL_INTEREST_ID {
-            zenoh_runtime::ZRuntime::Net.block_in_place(async move {
-                if let Some(runtime) = &tables.runtime {
-                    if let Some(runtime) = runtime.upgrade() {
-                        runtime
-                            .start_conditions()
-                            .terminate_peer_connector_zid(face.zid)
-                            .await
-                    }
+            // NOTE: called with the router ctrl_lock and the tables write lock
+            // held — must not block on another runtime (see gossip.rs
+            // link_states); terminate_peer_connector_zid is sync on purpose.
+            if let Some(runtime) = &tables.runtime {
+                if let Some(runtime) = runtime.upgrade() {
+                    runtime
+                        .start_conditions()
+                        .terminate_peer_connector_zid(face.zid)
                 }
-            });
+            }
         }
     }
 }
