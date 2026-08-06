@@ -72,6 +72,25 @@ impl SyncGroup {
 
     #[zenoh_macros::pub_visibility_if_internal]
     pub(crate) fn wait(&self) {
+        // NOTE: waiting for callback drain from inside a zenoh callback can
+        // never complete: the currently-executing callback pins a live
+        // `Callback` clone — and therefore one of the very permits awaited
+        // below — on this thread's own stack, a few frames beneath us. The
+        // "no callback is running once this returns" contract is
+        // unsatisfiable by definition in that case (the caller *is* a running
+        // callback), so drain asynchronously instead of self-deadlocking.
+        // Observed in production as rmw_zenoh's ~SubscriptionData →
+        // ze_undeclare_advanced_subscriber parking a transport rx thread
+        // forever, freezing the whole session.
+        if crate::api::handlers::executing_callback_on_this_thread() {
+            tracing::warn!(
+                "SyncGroup::wait called from inside a zenoh callback; \
+                 draining callbacks asynchronously to avoid self-deadlock"
+            );
+            let this = self.clone();
+            ZRuntime::Application.spawn(async move { this.wait_async().await });
+            return;
+        }
         let s = self.semaphore.clone();
         let _p = ZRuntime::Application.block_in_place(s.acquire_many(Self::max_permits()));
         self.close();
