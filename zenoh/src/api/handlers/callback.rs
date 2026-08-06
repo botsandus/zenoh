@@ -14,9 +14,37 @@
 
 //! Callback handler trait.
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use crate::api::handlers::IntoHandler;
+
+thread_local! {
+    /// Number of zenoh user-callback invocations currently on this thread's
+    /// stack. Used by `SyncGroup::wait` to detect that it is being invoked
+    /// from inside a callback, where blocking until all callbacks drain can
+    /// never complete: the calling callback itself pins a live `Callback`
+    /// clone (and therefore its on-drop `SyncGroupNotifier` permit) a few
+    /// frames below the wait.
+    static CALLBACK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Returns true if the current thread is executing a zenoh user callback.
+pub(crate) fn executing_callback_on_this_thread() -> bool {
+    CALLBACK_DEPTH.with(|d| d.get() > 0)
+}
+
+struct CallbackDepthGuard;
+impl CallbackDepthGuard {
+    fn enter() -> Self {
+        CALLBACK_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+impl Drop for CallbackDepthGuard {
+    fn drop(&mut self) {
+        CALLBACK_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
 
 /// A function that can transform an [`FnMut`]`(T)` into
 /// an [`Fn`]`(T)` with the help of a [`Mutex`](std::sync::Mutex).
@@ -96,6 +124,7 @@ impl<T> Callback<T> {
     /// Call the inner callback.
     #[inline]
     pub fn call(&self, arg: T) {
+        let _depth = CallbackDepthGuard::enter();
         self.callable.call(arg)
     }
 
@@ -103,6 +132,7 @@ impl<T> Callback<T> {
     where
         T: CallbackParameter,
     {
+        let _depth = CallbackDepthGuard::enter();
         self.callable.call_with_message(msg)
     }
 
