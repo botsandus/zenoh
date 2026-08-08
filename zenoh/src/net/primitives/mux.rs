@@ -191,18 +191,39 @@ impl EPrimitives for Mux {
             reliability: Reliability::Reliable,
         };
         if self.can_schedule(&mut msg) {
-            self.handler.schedule(msg).unwrap_or(false)
-        } else {
-            match self.face.get().and_then(|f| f.upgrade()) {
-                Some(face) => face.send_response_final(&mut ResponseFinal {
-                    rid: request_id,
-                    ext_qos: qos,
-                    ext_tstamp: None,
-                }),
-                None => tracing::error!("Uninitialized multiplexer!"),
+            match self.handler.schedule(msg) {
+                Ok(true) => return true,
+                // The transport refused or failed to take the request (e.g.
+                // closed/closing under churn, or the blocking-push deadline
+                // fired). Without a ResponseFinal the query would silently
+                // lose this destination and the querier would wait for the
+                // full timeout — observed in production as service requests
+                // vanishing between client dispatch and server receive.
+                // Finalize this destination so the query completes promptly.
+                Ok(false) => {
+                    tracing::warn!(
+                        "Request {} could not be scheduled on transport: finalizing query",
+                        request_id
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Request {} could not be scheduled on transport ({}): finalizing query",
+                        request_id,
+                        e
+                    );
+                }
             }
-            false
         }
+        match self.face.get().and_then(|f| f.upgrade()) {
+            Some(face) => face.send_response_final(&mut ResponseFinal {
+                rid: request_id,
+                ext_qos: qos,
+                ext_tstamp: None,
+            }),
+            None => tracing::error!("Uninitialized multiplexer!"),
+        }
+        false
     }
 
     fn send_response(&self, msg: &mut Response) -> bool {
@@ -383,18 +404,34 @@ impl EPrimitives for McastMux {
             reliability: Reliability::Reliable,
         };
         if self.can_schedule(&mut msg) {
-            self.handler.schedule(msg).unwrap_or(false)
-        } else {
-            match self.face.get() {
-                Some(face) => face.send_response_final(&mut ResponseFinal {
-                    rid: request_id,
-                    ext_qos: qos,
-                    ext_tstamp: None,
-                }),
-                None => tracing::error!("Uninitialized multiplexer!"),
+            match self.handler.schedule(msg) {
+                Ok(true) => return true,
+                // See the unicast Mux above: a schedule failure must finalize
+                // this destination or the query silently hangs at the client.
+                Ok(false) => {
+                    tracing::warn!(
+                        "Request {} could not be scheduled on transport: finalizing query",
+                        request_id
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Request {} could not be scheduled on transport ({}): finalizing query",
+                        request_id,
+                        e
+                    );
+                }
             }
-            false
         }
+        match self.face.get() {
+            Some(face) => face.send_response_final(&mut ResponseFinal {
+                rid: request_id,
+                ext_qos: qos,
+                ext_tstamp: None,
+            }),
+            None => tracing::error!("Uninitialized multiplexer!"),
+        }
+        false
     }
 
     fn send_response(&self, msg: &mut Response) -> bool {
