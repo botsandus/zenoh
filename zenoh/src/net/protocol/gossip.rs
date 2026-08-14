@@ -197,7 +197,15 @@ impl Gossip {
             whatami: self.graph[idx].whatami,
             locators: if details.locators {
                 if idx == self.idx {
-                    Some(self.runtime.upgrade().unwrap().get_locators_noloopback())
+                    // NOTE: advertise loopback locators too (as zenoh <= #2096 did).
+                    // Same-host peers that listen only on loopback (e.g. rmw_zenoh's
+                    // default `listen: tcp/localhost:0`) otherwise gossip an EMPTY
+                    // locator list, the peer-to-peer mesh never forms, and — since
+                    // routers no longer broker data between their south peers — such
+                    // peers have no data path at all. A remote peer receiving a
+                    // loopback locator merely fails the dial and tries the next one,
+                    // exactly as in pre-regions zenoh.
+                    Some(self.runtime.upgrade().unwrap().get_locators())
                 } else {
                     self.graph[idx].locators.clone()
                 }
