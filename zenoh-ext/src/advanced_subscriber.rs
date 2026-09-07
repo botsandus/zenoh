@@ -830,12 +830,21 @@ impl<Handler> AdvancedSubscriber<Handler> {
 
         // When the underlying subscriber is undeclared (for example when the session is closed)
         // the advanced subscriber callback must be dropped to "close" the receiver.
+        //
+        // This can run on the rx thread *inside* one of our own callbacks: e.g. a
+        // history reply is delivered through `handle_sample` (which holds the
+        // `State` mutex) into the user callback, and the user (rmw_zenoh) turns out
+        // to hold the last reference to its subscription and destroys it there,
+        // undeclaring this very subscriber. Blocking on the mutex then
+        // self-deadlocks the rx thread forever, wedging every link it serves.
+        // Never block here: tear down under the lock if it is free, else defer.
         let drop_callback = {
             let statesref = statesref.clone();
             move || {
-                let mut states = statesref.lock().unwrap();
-                states.callback.take();
-                states.miss_handlers.clear();
+                run_with_state_or_defer(statesref.clone(), |_, states| {
+                    states.callback.take();
+                    states.miss_handlers.clear();
+                });
             }
         };
 
@@ -1425,6 +1434,50 @@ fn flush_timestamped_source(
     }
 }
 
+/// Run `f` with the `State` locked, without ever blocking the current thread.
+///
+/// Teardown code (query-reply handlers being dropped, the subscriber callback
+/// being dropped on undeclare) may execute on a zenoh rx thread that already
+/// holds the `State` mutex a few frames up -- e.g. a history reply delivered via
+/// `handle_sample` into the user callback, where the user destroys the last
+/// owner of its subscription and undeclares us. A blocking `lock()` there
+/// self-deadlocks the rx thread for good. If the lock is free (or merely
+/// poisoned) run `f` now; otherwise defer it to the application runtime, where
+/// it runs once the current holder has returned and released the lock.
+#[zenoh_macros::unstable]
+fn run_with_state_or_defer<F>(statesref: Arc<Mutex<State>>, f: F)
+where
+    F: FnOnce(&Arc<Mutex<State>>, &mut State) + Send + 'static,
+{
+    // Decide under the (non-blocking) lock attempt; the temporary guard's borrow
+    // of `statesref` ends with the match, so it can be moved into the deferred
+    // task afterwards.
+    let deferred = match statesref.try_lock() {
+        Ok(mut guard) => {
+            f(&statesref, &mut guard);
+            None
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            let mut guard = poisoned.into_inner();
+            f(&statesref, &mut guard);
+            None
+        }
+        Err(std::sync::TryLockError::WouldBlock) => Some(f),
+    };
+    if let Some(f) = deferred {
+        tracing::debug!(
+            "AdvancedSubscriber: state locked during teardown (undeclare from within a callback?), deferring"
+        );
+        ZRuntime::Application.spawn(async move {
+            let mut guard = match statesref.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            f(&statesref, &mut guard);
+        });
+    }
+}
+
 #[zenoh_macros::unstable]
 #[derive(Clone)]
 struct InitialRepliesHandler {
@@ -1434,27 +1487,28 @@ struct InitialRepliesHandler {
 #[zenoh_macros::unstable]
 impl Drop for InitialRepliesHandler {
     fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        states.global_pending_queries = states.global_pending_queries.saturating_sub(1);
-        tracing::trace!(
-            "AdvancedSubscriber{{key_expr: {}}}: Flush initial replies",
-            states.key_expr
-        );
+        run_with_state_or_defer(self.statesref.clone(), |statesref, states| {
+            states.global_pending_queries = states.global_pending_queries.saturating_sub(1);
+            tracing::trace!(
+                "AdvancedSubscriber{{key_expr: {}}}: Flush initial replies",
+                states.key_expr
+            );
 
-        if states.global_pending_queries == 0 {
-            for (source_id, state) in states.sequenced_states.iter_mut() {
-                flush_sequenced_source(
-                    state,
-                    states.callback.as_ref(),
-                    source_id,
-                    &states.miss_handlers,
-                );
-                spawn_periodic_queries!(states, *source_id, self.statesref.clone());
+            if states.global_pending_queries == 0 {
+                for (source_id, state) in states.sequenced_states.iter_mut() {
+                    flush_sequenced_source(
+                        state,
+                        states.callback.as_ref(),
+                        source_id,
+                        &states.miss_handlers,
+                    );
+                    spawn_periodic_queries!(states, *source_id, statesref.clone());
+                }
+                for state in states.timestamped_states.values_mut() {
+                    flush_timestamped_source(state, states.callback.as_ref());
+                }
             }
-            for state in states.timestamped_states.values_mut() {
-                flush_timestamped_source(state, states.callback.as_ref());
-            }
-        }
+        });
     }
 }
 
@@ -1468,22 +1522,24 @@ struct SequencedRepliesHandler {
 #[zenoh_macros::unstable]
 impl Drop for SequencedRepliesHandler {
     fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        if let Some(state) = states.sequenced_states.get_mut(&self.source_id) {
-            state.pending_queries = state.pending_queries.saturating_sub(1);
-            if states.global_pending_queries == 0 {
-                tracing::trace!(
-                    "AdvancedSubscriber{{key_expr: {}}}: Flush sequenced samples",
-                    states.key_expr
-                );
-                flush_sequenced_source(
-                    state,
-                    states.callback.as_ref(),
-                    &self.source_id,
-                    &states.miss_handlers,
-                )
+        let source_id = self.source_id;
+        run_with_state_or_defer(self.statesref.clone(), move |_, states| {
+            if let Some(state) = states.sequenced_states.get_mut(&source_id) {
+                state.pending_queries = state.pending_queries.saturating_sub(1);
+                if states.global_pending_queries == 0 {
+                    tracing::trace!(
+                        "AdvancedSubscriber{{key_expr: {}}}: Flush sequenced samples",
+                        states.key_expr
+                    );
+                    flush_sequenced_source(
+                        state,
+                        states.callback.as_ref(),
+                        &source_id,
+                        &states.miss_handlers,
+                    )
+                }
             }
-        }
+        });
     }
 }
 
@@ -1497,17 +1553,19 @@ struct TimestampedRepliesHandler {
 #[zenoh_macros::unstable]
 impl Drop for TimestampedRepliesHandler {
     fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        if let Some(state) = states.timestamped_states.get_mut(&self.id) {
-            state.pending_queries = state.pending_queries.saturating_sub(1);
-            if states.global_pending_queries == 0 {
-                tracing::trace!(
-                    "AdvancedSubscriber{{key_expr: {}}}: Flush timestamped samples",
-                    states.key_expr
-                );
-                flush_timestamped_source(state, states.callback.as_ref());
+        let id = self.id;
+        run_with_state_or_defer(self.statesref.clone(), move |_, states| {
+            if let Some(state) = states.timestamped_states.get_mut(&id) {
+                state.pending_queries = state.pending_queries.saturating_sub(1);
+                if states.global_pending_queries == 0 {
+                    tracing::trace!(
+                        "AdvancedSubscriber{{key_expr: {}}}: Flush timestamped samples",
+                        states.key_expr
+                    );
+                    flush_timestamped_source(state, states.callback.as_ref());
+                }
             }
-        }
+        });
     }
 }
 
