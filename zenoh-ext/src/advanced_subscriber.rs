@@ -497,6 +497,10 @@ struct SourceState<T> {
     latest_access: Instant,
     /// Periodic queries task
     periodic_task: Option<AbortOnDropHandle<()>>,
+    /// History re-query watchdog: re-issues the historical-data query, with
+    /// backoff, while the publisher is alive but has delivered nothing yet.
+    /// See [`spawn_history_retry`].
+    history_retry_task: Option<AbortOnDropHandle<()>>,
     /// Alive as per liveliness subscriber
     alive: bool,
 }
@@ -508,6 +512,7 @@ impl<T> Default for SourceState<T> {
             pending_queries: 0,
             pending_samples: BTreeMap::new(),
             periodic_task: None,
+            history_retry_task: None,
             alive: false,
             latest_access: Instant::now(),
         }
@@ -985,7 +990,197 @@ fn spawn_periodic_queries(
     )))
 }
 
+/// Initial delay before the first history re-query for a source that has
+/// delivered nothing; doubled after every attempt up to [`HISTORY_RETRY_MAX`].
+const HISTORY_RETRY_INITIAL: Duration = Duration::from_secs(2);
+/// Upper bound on the history re-query backoff.
+const HISTORY_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Timeout applied to retried history queries. The configured `query_timeout`
+/// may be unbounded (rmw_zenoh uses `u64::MAX`); a finite timeout here keeps
+/// the retry loop progressing even if an earlier query is never finalized.
+const HISTORY_RETRY_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// If a history query for a source has been outstanding this long without
+/// delivering anything, treat it as hung (its reply or ResponseFinal was lost)
+/// and issue a retry alongside it rather than waiting on it forever. A large
+/// latched sample completes in a few seconds when the transport is healthy.
+const HISTORY_RETRY_STALL: Duration = Duration::from_secs(15);
+/// Poll period of the history-retry watchdog while it is waiting on an
+/// in-flight query.
+const HISTORY_RETRY_POLL: Duration = Duration::from_secs(2);
+
+/// Re-query a publisher's history, with capped backoff, until something is delivered.
+///
+/// A TRANSIENT_LOCAL publisher hands its latched samples to a late-joining
+/// subscriber through a one-shot query issued when the publisher is
+/// discovered. If that single reply is lost -- e.g. a large sample blocking
+/// past `wait_before_close` and closing the transport under startup churn --
+/// the query finalizes with zero samples and nothing re-asks: periodic
+/// re-queries only run when `periodic_queries` is configured (rmw_zenoh uses
+/// heartbeat recovery instead), and a sporadic heartbeat is only emitted after
+/// a *new* publication, never for a sample latched long before the subscriber
+/// existed. The subscriber therefore never receives the latched sample.
+///
+/// This task keeps re-querying the source while it is still alive (liveliness
+/// token present) and has delivered nothing. It exits as soon as any sample is
+/// delivered, or the publisher's token is deleted. To avoid requesting a large
+/// reply twice while a slow transfer is in flight, it only retries once the
+/// previous query has finalized, unless that query has stalled for
+/// [`HISTORY_RETRY_STALL`].
+#[zenoh_macros::unstable]
+fn spawn_history_retry(
+    statesref: &Arc<Mutex<State>>,
+    source_id: EntityGlobalId,
+) -> AbortOnDropHandle<()> {
+    // NOTE: the caller holds the `State` mutex; do not lock it here (the mutex
+    // is not reentrant and this runs on the zenoh rx thread).
+    //
+    // Hold only a `Weak` to the state: the task's handle lives inside the
+    // state, so a strong reference would form a cycle that keeps a dropped
+    // subscriber's state (and this task) alive forever. With a `Weak`, dropping
+    // the subscriber drops the state, which drops the handle and aborts us.
+    let weak = Arc::downgrade(statesref);
+    AbortOnDropHandle::new(ZRuntime::Application.spawn(async move {
+        tracing::debug!(
+            "History-retry watchdog task started for publisher {:?}",
+            source_id
+        );
+        // Time since the last history query was (re)issued for this source; the
+        // first query is the one issued by the caller right after arming.
+        let mut last_query = Instant::now();
+        let mut backoff = HISTORY_RETRY_INITIAL;
+        let mut wait = HISTORY_RETRY_INITIAL;
+        loop {
+            tokio::time::sleep(wait).await;
+            tracing::trace!(
+                "History-retry watchdog tick for publisher {:?} (slept {:?})",
+                source_id,
+                wait
+            );
+            let Some(statesref) = weak.upgrade() else {
+                tracing::debug!(
+                    "History-retry watchdog for {:?} exiting: subscriber dropped",
+                    source_id
+                );
+                return;
+            };
+            // Set when buffered samples were flushed (staged) under the lock; the
+            // outbox is dispatched below, once the lock is released.
+            let mut flushed = false;
+            let retry_now = {
+                // Never block the (single-threaded) application runtime on this
+                // mutex: if it is contended -- or wedged by a stuck callback --
+                // skip this tick and look again later.
+                let mut guard = match statesref.try_lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        tracing::trace!(
+                            "History-retry watchdog for {:?}: state busy, skipping tick",
+                            source_id
+                        );
+                        wait = HISTORY_RETRY_POLL;
+                        continue;
+                    }
+                };
+                let states = &mut *guard;
+                // peek_mut so a source with no samples can still be garbage collected
+                let Some(state) = states.sequenced_states.peek_mut(&source_id) else {
+                    tracing::debug!(
+                        "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog for {:?} exiting: source state gone",
+                        states.key_expr,
+                        source_id
+                    );
+                    return;
+                };
+                if !state.alive || state.last_delivered.is_some() {
+                    tracing::debug!(
+                        "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog for {:?} exiting: alive={} delivered={}",
+                        states.key_expr,
+                        source_id,
+                        state.alive,
+                        state.last_delivered.is_some()
+                    );
+                    return;
+                }
+                let stalled = last_query.elapsed() >= HISTORY_RETRY_STALL;
+                // Samples arrived but are held back waiting for pending queries to
+                // finalize. If those queries have stalled (reply/final lost) they
+                // never will: flush what we have rather than hold it hostage.
+                if !state.pending_samples.is_empty() {
+                    if stalled {
+                        tracing::debug!(
+                            "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog for {:?}: {} buffered sample(s) stuck behind {} stalled query(ies), flushing",
+                            states.key_expr,
+                            source_id,
+                            state.pending_samples.len(),
+                            state.pending_queries
+                        );
+                        if let Some(callback) = states.callback.clone() {
+                            flush_sequenced_source(
+                                state,
+                                &callback,
+                                &source_id,
+                                &states.miss_handlers,
+                                &mut states.outbox,
+                            );
+                        }
+                        flushed = true;
+                        false
+                    } else {
+                        false
+                    }
+                } else if state.pending_queries > 0 && !stalled {
+                    // A query is still in flight: let it finish rather than
+                    // requesting the (possibly large) history a second time.
+                    tracing::trace!(
+                        "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog for {:?}: {} query(ies) in flight for {:?}, waiting",
+                        states.key_expr,
+                        source_id,
+                        state.pending_queries,
+                        last_query.elapsed()
+                    );
+                    false
+                } else {
+                    tracing::debug!(
+                        "AdvancedSubscriber{{key_expr: {}}}: History from alive publisher {:?} not delivered ({} query(ies) pending, stalled={}), retrying historical query (backoff {:?})",
+                        states.key_expr,
+                        source_id,
+                        state.pending_queries,
+                        stalled,
+                        backoff
+                    );
+                    true
+                }
+            };
+            if flushed {
+                // Deliver what was staged, with the state lock released (#2744).
+                dispatch_outbox(&statesref);
+                return;
+            }
+            if retry_now {
+                query_source_history(&statesref, source_id, Some(HISTORY_RETRY_QUERY_TIMEOUT));
+                last_query = Instant::now();
+                wait = backoff;
+                backoff = (backoff * 2).min(HISTORY_RETRY_MAX);
+            } else {
+                wait = HISTORY_RETRY_POLL;
+            }
+        }
+    }))
+}
+
 fn periodic_query(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
+    query_source_history(statesref, source_id, None)
+}
+
+/// Query the undelivered historical samples of one sequenced source.
+///
+/// `timeout_override` replaces the configured `query_timeout` when set (used
+/// by the history retry so the loop always makes progress).
+fn query_source_history(
+    statesref: &Arc<Mutex<State>>,
+    source_id: EntityGlobalId,
+    timeout_override: Option<Duration>,
+) {
     let mut guard = statesref.lock().unwrap();
     let states = &mut *guard;
     // use peek_mut so query without samples do not prevent the state to be garbage collected
@@ -1004,7 +1199,7 @@ fn periodic_query(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
     let session = states.session.clone();
     let key_expr = states.key_expr.clone().into_owned();
     let query_target = states.query_target;
-    let query_timeout = states.query_timeout;
+    let query_timeout = timeout_override.unwrap_or(states.query_timeout);
 
     tracing::trace!(
         "AdvancedSubscriber{{key_expr: {}}}: Querying undelivered samples {}?{}",
@@ -1435,6 +1630,16 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                         states.period,
                                         source_id,
                                     );
+                                    // The single history query below can be lost
+                                    // under churn; keep re-asking this alive
+                                    // publisher until something is delivered.
+                                    tracing::debug!(
+                                        "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog armed for publisher {:?}",
+                                        states.key_expr,
+                                        source_id
+                                    );
+                                    state.history_retry_task =
+                                        Some(spawn_history_retry(&statesref, source_id));
                                 }
                                 state.pending_queries += 1;
                                 state.alive = true;
