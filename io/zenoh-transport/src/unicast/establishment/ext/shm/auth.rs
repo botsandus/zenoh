@@ -341,7 +341,7 @@ impl<'a> OpenFsm for &'a ShmFsm<'a> {
         let codec = Zenoh080::new();
         let mut reader = ext.value.reader();
         let Ok(init_ack): Result<InitAck, _> = codec.read(&mut reader) else {
-            tracing::trace!("{} Decoding error.", S);
+            tracing::warn!("{} Decoding error: SHM disabled for this link.", S);
             return Ok(());
         };
 
@@ -354,7 +354,11 @@ impl<'a> OpenFsm for &'a ShmFsm<'a> {
         let bob_segment = match RXAuthSegment::open(init_ack.bob_segment) {
             Ok(buff) => buff,
             Err(e) => {
-                tracing::trace!("{} {}", S, e);
+                tracing::warn!(
+                    "{} Cannot open the peer's SHM auth segment ({}): SHM disabled for this link.",
+                    S,
+                    e
+                );
                 return Ok(());
             }
         };
@@ -426,12 +430,15 @@ impl<'a> OpenFsm for &'a ShmFsm<'a> {
         let codec = Zenoh080::new();
         let mut reader = ext.value.reader();
         let Ok(open_ack): Result<OpenAck, _> = codec.read(&mut reader) else {
-            tracing::trace!("{} Decoding error.", S);
+            tracing::warn!("{} Decoding error: SHM disabled for this link.", S);
             return Ok(());
         };
 
         let Ok(rx_handoff) = RxHandoffChannel::new_rx(segment, open_ack.bob_counters) else {
-            tracing::trace!("{} Handoff channel creation error.", S);
+            tracing::warn!(
+                "{} Handoff channel creation error: SHM disabled for this link.",
+                S
+            );
             return Ok(());
         };
 
@@ -492,7 +499,7 @@ impl<'a> AcceptFsm for &'a ShmFsm<'a> {
         let codec = Zenoh080::new();
         let mut reader = ext.value.reader();
         let Ok(init_syn): Result<InitSyn, _> = codec.read(&mut reader) else {
-            tracing::trace!("{} Decoding error.", S);
+            tracing::warn!("{} Decoding error: SHM disabled for this link.", S);
             return Ok(());
         };
 
@@ -500,7 +507,11 @@ impl<'a> AcceptFsm for &'a ShmFsm<'a> {
         let alice_segment = match RXAuthSegment::open(init_syn.alice_segment) {
             Ok(buff) => buff,
             Err(e) => {
-                tracing::trace!("{} {}", S, e);
+                tracing::warn!(
+                    "{} Cannot open the peer's SHM auth segment ({}): SHM disabled for this link.",
+                    S,
+                    e
+                );
                 return Ok(());
             }
         };
@@ -559,7 +570,7 @@ impl<'a> AcceptFsm for &'a ShmFsm<'a> {
         let codec = Zenoh080::new();
         let mut reader = ext.value.reader();
         let Ok(open_syn): Result<OpenSyn, _> = codec.read(&mut reader) else {
-            tracing::trace!("{} Decoding error.", S);
+            tracing::warn!("{} Decoding error: SHM disabled for this link.", S);
             bail!("");
         };
 
@@ -570,7 +581,10 @@ impl<'a> AcceptFsm for &'a ShmFsm<'a> {
 
         // Allocate RX counter for this session
         let Ok(rx_handoff) = RxHandoffChannel::new_rx(segment, open_syn.alice_counters) else {
-            tracing::trace!("{} Handoff channel creation error.", S);
+            tracing::warn!(
+                "{} Handoff channel creation error: SHM disabled for this link.",
+                S
+            );
             return Ok(());
         };
 
