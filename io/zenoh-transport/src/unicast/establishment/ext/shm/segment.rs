@@ -54,8 +54,8 @@ struct ShmTransportMetadata {
 impl ShmTransportMetadata {
     fn validate(&self, expected_challenge: AuthChallenge, s: &str) -> bool {
         if self.challenge != expected_challenge {
-            tracing::debug!(
-                "{} Challenge mismatch: expected: {}, found in shm: {}.",
+            tracing::warn!(
+                "{} Challenge mismatch: expected: {}, found in shm: {}. SHM disabled for this link.",
                 s,
                 expected_challenge,
                 self.challenge
