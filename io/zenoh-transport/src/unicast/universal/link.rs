@@ -198,6 +198,8 @@ impl TransportLinkUnicastUniversal {
 
             if let Err(e) = res {
                 tracing::debug!("TX task failed: {}", e);
+                // dexory: unexpected loss (not a Close from the peer) -> candidate for reconnect
+                transport.hint_reconnect();
                 // Spawn a task to avoid a deadlock waiting for this same task
                 // to finish in the close() joining its handle
                 // TODO(yuyuan): do more study to check which ZRuntime should be used or refine the
@@ -234,6 +236,9 @@ impl TransportLinkUnicastUniversal {
             if let Err(e) = res {
                 // process error if task was not cancelled
                 tracing::debug!("RX task failed: {}", e);
+                // dexory: read error or lease expiry (never a graceful Close, which is handled
+                // in rx.rs and cancels this task with Ok) -> candidate for reconnect
+                transport.hint_reconnect();
 
                 // Spawn a task to avoid a deadlock waiting for this same task
                 // to finish in the close() joining its handle

@@ -579,6 +579,10 @@ validated_struct::validator! {
                 autoconnect: Option<ModeDependentValue<WhatAmIMatcher>>,
                 /// Strategy for autoconnection, mainly to avoid nodes connecting to each other redundantly.
                 autoconnect_strategy: Option<ModeDependentValue<TargetDependentValue<AutoConnectStrategy>>>,
+                /// dexory: whether to re-establish (with `connect/retry` backoff) the transport to a peer
+                /// discovered through gossip when that transport ends unexpectedly (link error, lease
+                /// expiry, or the peer closing us as unresponsive). Default true.
+                reconnect_on_close: Option<bool>,
             },
         },
 

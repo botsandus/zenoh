@@ -11,7 +11,12 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use rand::{RngCore, SeedableRng};
 use tokio::sync::Mutex as AsyncMutex;
@@ -632,6 +637,12 @@ pub struct TransportManager {
     #[cfg(feature = "stats")]
     pub(crate) stats: zenoh_stats::StatsRegistry,
     pub(crate) task_controller: TaskController,
+    /// dexory fork: peers whose unicast transport was lost WITHOUT a graceful Close from
+    /// them (link error, lease expiry, or a Close with reason UNRESPONSIVE/EXPIRED, i.e. the
+    /// peer cut us because we were slow). The routing layer consumes a hint when it drops
+    /// the peer from its gossip graph and re-establishes the transport with retry
+    /// (`Runtime::reconnect_peer`). A peer that shut down cleanly leaves no hint.
+    pub(crate) reconnect_hints: Arc<Mutex<HashMap<ZenohIdProto, Vec<Locator>>>>,
 }
 
 impl fmt::Debug for TransportManager {
@@ -653,6 +664,32 @@ impl fmt::Debug for TransportManager {
 }
 
 impl TransportManager {
+    /// Record that the transport to `zid` ended unexpectedly (see `reconnect_hints`).
+    /// `remote_locators` are the remote ends of the links the transport had: on the side
+    /// that initiated the link this is the peer's listener, usable to reconnect even when
+    /// the gossip graph holds no locators for the peer (a peer advertises its own locators
+    /// without loopback ones, so same-host peers listening on localhost advertise none).
+    pub fn hint_reconnect(&self, zid: ZenohIdProto, remote_locators: Vec<Locator>) {
+        let mut hints = self
+            .reconnect_hints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = hints.entry(zid).or_default();
+        for l in remote_locators {
+            if !entry.contains(&l) {
+                entry.push(l);
+            }
+        }
+    }
+
+    /// Consume the reconnect hint for `zid`: the remote locators recorded with it, if any.
+    pub fn take_reconnect_hint(&self, zid: &ZenohIdProto) -> Option<Vec<Locator>> {
+        self.reconnect_hints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(zid)
+    }
+
     pub fn new(
         params: TransportManagerParams,
         mut prng: PseudoRng,
@@ -676,6 +713,7 @@ impl TransportManager {
             #[cfg(feature = "stats")]
             stats,
             task_controller: TaskController::default(),
+            reconnect_hints: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // @TODO: this should be moved into the unicast module

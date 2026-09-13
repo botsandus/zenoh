@@ -99,6 +99,9 @@ pub(crate) struct TransportUnicastUniversal {
     // Transport statistics
     #[cfg(feature = "stats")]
     pub(super) stats: zenoh_stats::TransportStats,
+    // dexory: the peer sent a graceful Close (it is shutting down): the link errors that
+    // follow must not leave a reconnect hint.
+    pub(super) peer_closed_gracefully: Arc<AtomicBool>,
 }
 
 impl TransportUnicastUniversal {
@@ -143,6 +146,7 @@ impl TransportUnicastUniversal {
             stats,
             #[cfg(feature = "shared-memory")]
             shm_context,
+            peer_closed_gracefully: Arc::new(AtomicBool::new(false)),
         });
 
         Ok(t)
@@ -151,6 +155,31 @@ impl TransportUnicastUniversal {
     /*************************************/
     /*           TERMINATION             */
     /*************************************/
+    /// dexory: leave a reconnect hint for this transport's peer, with the remote ends of
+    /// the links it still holds (see `TransportManager::hint_reconnect`).
+    pub(super) fn hint_reconnect(&self) {
+        if self.peer_closed_gracefully.load(Ordering::Relaxed) {
+            tracing::debug!(
+                "[{}] Transport to {} ended after a graceful Close from the peer: no reconnect hint",
+                self.manager.config.zid,
+                self.config.zid
+            );
+            return;
+        }
+        let remote: Vec<_> = zread!(self.links)
+            .get_links()
+            .iter()
+            .map(|l| l.link.link().dst)
+            .collect();
+        tracing::debug!(
+            "[{}] Transport to {} lost unexpectedly: reconnect hint with remote locators {:?}",
+            self.manager.config.zid,
+            self.config.zid,
+            remote
+        );
+        self.manager.hint_reconnect(self.config.zid, remote);
+    }
+
     pub(super) async fn delete(&self) -> ZResult<()> {
         tracing::debug!(
             "[{}] Closing transport with peer: {}",

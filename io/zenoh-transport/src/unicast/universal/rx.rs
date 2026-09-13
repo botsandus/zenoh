@@ -66,7 +66,24 @@ impl TransportUnicastUniversal {
         callback.handle_message(msg)
     }
 
-    fn handle_close(&self, link: &Link, _reason: u8, session: bool) -> ZResult<()> {
+    fn handle_close(&self, link: &Link, reason: u8, session: bool) -> ZResult<()> {
+        // dexory: a peer that closed us as UNRESPONSIVE (its non-droppable push to us hit
+        // wait_before_close) or EXPIRED (it stopped hearing from us) is still alive; now that
+        // we are reading again we should re-establish the transport. Any other reason
+        // (GENERIC = the peer shut down, MAX_LINKS, ...) leaves no hint.
+        // The `session` flag is not a signal here: a session close is sent as a Close on
+        // each link with session=false (see `close()`), so the reason alone decides.
+        use zenoh_protocol::transport::close::reason;
+        if reason == reason::UNRESPONSIVE || reason == reason::EXPIRED {
+            self.hint_reconnect();
+        } else {
+            // The peer is going away on purpose; the EOF/reset its socket close produces
+            // right after this must not be mistaken for an unexpected loss, and no hint
+            // left by an earlier link-level loss may survive it.
+            self.peer_closed_gracefully
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.manager.take_reconnect_hint(&self.config.zid);
+        }
         // Delete and clean up
         let c_transport = self.clone();
         let c_link = link.clone();

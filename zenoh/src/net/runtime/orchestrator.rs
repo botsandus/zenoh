@@ -50,6 +50,13 @@ use crate::net::{common::AutoConnect, protocol::linkstate::LinkInfo};
 
 const RCV_BUF_SIZE: usize = u16::MAX as usize;
 const SCOUT_INITIAL_PERIOD: Duration = Duration::from_millis(1_000);
+/// dexory: how long a peer whose transport ended unexpectedly is chased before giving up.
+/// The side that resumes or notices the loss normally succeeds at its first attempt; the
+/// bound only limits churn against a peer that died without sending a Close.
+const RECONNECT_GIVE_UP: Duration = Duration::from_secs(60);
+/// dexory: random extra delay per attempt, so two peers that lost the same link do not
+/// keep colliding (the manager then rejects one of the two links as MAX_LINKS).
+const RECONNECT_MAX_JITTER_MS: u64 = 500;
 const SCOUT_MAX_PERIOD: Duration = Duration::from_millis(8_000);
 const SCOUT_PERIOD_INCREASE_FACTOR: u32 = 2;
 
@@ -1085,6 +1092,17 @@ impl Runtime {
     /// Returns `true` if a new Transport instance is established with `zid` or had already been established.
     #[must_use]
     async fn connect(&self, zid: &ZenohIdProto, scouted_locators: &[Locator]) -> bool {
+        self.connect_impl(zid, scouted_locators, false).await
+    }
+
+    /// `quiet`: log a failed attempt at debug instead of warn (retry loops).
+    #[must_use]
+    async fn connect_impl(
+        &self,
+        zid: &ZenohIdProto,
+        scouted_locators: &[Locator],
+        quiet: bool,
+    ) -> bool {
         if scouted_locators.is_empty() {
             return false;
         }
@@ -1186,11 +1204,19 @@ impl Runtime {
         self.remove_pending_connection(zid).await;
 
         if self.manager().get_transport_unicast(zid).await.is_none() {
-            tracing::warn!(
-                "Unable to connect to any locator of scouted peer {}: {:?}",
-                zid,
-                scouted_locators
-            );
+            if quiet {
+                tracing::debug!(
+                    "Unable to connect to any locator of scouted peer {}: {:?}",
+                    zid,
+                    scouted_locators
+                );
+            } else {
+                tracing::warn!(
+                    "Unable to connect to any locator of scouted peer {}: {:?}",
+                    zid,
+                    scouted_locators
+                );
+            }
             false
         } else {
             true
@@ -1199,6 +1225,89 @@ impl Runtime {
 
     /// Returns `true` if a new Transport instance is established with `zid` or had already been established.
     pub async fn connect_peer(&self, zid: &ZenohIdProto, locators: &[Locator]) -> bool {
+        self.connect_peer_impl(zid, locators, false).await
+    }
+
+    /// dexory: re-establish the transport to a gossip-learned peer whose transport ended
+    /// unexpectedly (see `TransportManager::reconnect_hints`). Retries with the configured
+    /// `connect/retry` backoff until the transport exists again (established by either
+    /// side) or `RECONNECT_GIVE_UP` elapses. Disabled by `scouting/gossip/reconnect_on_close`.
+    pub(crate) fn reconnect_peer(
+        &self,
+        zid: ZenohIdProto,
+        whatami: WhatAmI,
+        locators: Vec<Locator>,
+    ) {
+        let retry = {
+            let guard = &self.state.config.lock();
+            if !unwrap_or_default!(guard.scouting().gossip().reconnect_on_close()) {
+                tracing::debug!(
+                    "Transport to {} {} lost; not reconnecting (scouting/gossip/reconnect_on_close is false)",
+                    whatami,
+                    zid
+                );
+                return;
+            }
+            zenoh_config::get_retry_config(guard, None, false)
+        };
+        let runtime = self.clone();
+        self.spawn(async move {
+            use rand::Rng;
+            let start = std::time::Instant::now();
+            let mut period = retry.period();
+            let mut attempt = 0u32;
+            loop {
+                let jitter = rand::thread_rng().gen_range(0..RECONNECT_MAX_JITTER_MS);
+                tokio::time::sleep(period.next_duration() + Duration::from_millis(jitter)).await;
+                if runtime.is_closed() {
+                    return;
+                }
+                if runtime.manager().get_transport_unicast(&zid).await.is_some() {
+                    tracing::debug!(
+                        "Transport to {} {} is back (established by the peer); reconnect not needed",
+                        whatami,
+                        zid
+                    );
+                    return;
+                }
+                attempt += 1;
+                tracing::debug!(
+                    "Reconnecting to {} {} after unexpected transport loss (attempt {}) via {:?}",
+                    whatami,
+                    zid,
+                    attempt,
+                    locators
+                );
+                if runtime.connect_peer_impl(&zid, &locators, true).await {
+                    tracing::info!(
+                        "Re-established transport to {} {} {:.1} s after it was lost (attempt {})",
+                        whatami,
+                        zid,
+                        start.elapsed().as_secs_f64(),
+                        attempt
+                    );
+                    return;
+                }
+                if start.elapsed() >= RECONNECT_GIVE_UP {
+                    tracing::debug!(
+                        "Giving up reconnecting to {} {} after {} attempts in {:.0} s; assuming it is gone",
+                        whatami,
+                        zid,
+                        attempt,
+                        start.elapsed().as_secs_f64()
+                    );
+                    return;
+                }
+            }
+        });
+    }
+
+    async fn connect_peer_impl(
+        &self,
+        zid: &ZenohIdProto,
+        locators: &[Locator],
+        quiet: bool,
+    ) -> bool {
         let manager = self.manager();
         if zid != &manager.zid() {
             let has_unicast = manager.get_transport_unicast(zid).await.is_some();
@@ -1216,7 +1325,7 @@ impl Runtime {
 
             if !has_unicast && !has_multicast {
                 tracing::debug!("Try to connect to peer {} via any of {:?}", zid, locators);
-                self.connect(zid, locators).await
+                self.connect_impl(zid, locators, quiet).await
             } else {
                 tracing::trace!("Already connected scouted peer: {}", zid);
                 true

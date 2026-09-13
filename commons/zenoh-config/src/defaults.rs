@@ -104,6 +104,7 @@ pub mod scouting {
     pub mod gossip {
         pub const enabled: bool = true;
         pub const multihop: bool = false;
+        pub const reconnect_on_close: bool = true;
         pub mod target {
             pub const router: &crate::WhatAmIMatcher = // "router|peer"
                 &crate::WhatAmIMatcher::empty().router().peer();

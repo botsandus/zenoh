@@ -11,7 +11,7 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::convert::TryInto;
+use std::{collections::HashMap, convert::TryInto};
 
 use petgraph::graph::NodeIndex;
 use vec_map::VecMap;
@@ -111,6 +111,11 @@ pub(crate) struct Gossip {
     pub(crate) links: VecMap<Link>,
     pub(crate) graph: petgraph::stable_graph::StableUnGraph<Node, f64>,
     pub(crate) runtime: WeakRuntime,
+    /// dexory: the last non-empty locators gossiped for each node, by anyone. A node's own
+    /// linkstate over a direct link omits loopback locators, so a same-host peer's graph node
+    /// carries none; the router's gossip about it did carry them. Used to reconnect after an
+    /// unexpected transport loss.
+    pub(crate) gossiped_locators: HashMap<ZenohIdProto, Vec<Locator>>,
 }
 
 impl Gossip {
@@ -141,6 +146,7 @@ impl Gossip {
             links: VecMap::new(),
             graph,
             runtime: Runtime::downgrade(&runtime),
+            gossiped_locators: HashMap::new(),
         }
     }
 
@@ -340,6 +346,9 @@ impl Gossip {
         }
 
         for (zid, whatami, locators, sn, _links, is_gateway) in link_states.into_iter() {
+            if let Some(l) = locators.as_ref().filter(|l| !l.is_empty()) {
+                self.gossiped_locators.insert(zid, l.clone());
+            }
             if zid == src {
                 let idx = match self.get_idx(&zid) {
                     None => {
@@ -525,7 +534,52 @@ impl Gossip {
         self.links.retain(|_, link| link.zid != *zid);
 
         if let Some(idx) = self.get_idx(zid) {
-            self.graph.remove_node(idx);
+            let node = self.graph.remove_node(idx);
+            // dexory: nothing re-announces a gossip-learned peer once its transport is gone
+            // (the router does not broker between peers and only gossips NEW nodes), so a
+            // transport that ended unexpectedly would stay down until one side restarts.
+            // Re-establish it ourselves when the transport layer left a reconnect hint.
+            if let (Some(node), Some(runtime)) = (node, self.runtime.upgrade()) {
+                let hint = runtime.manager().take_reconnect_hint(zid);
+                tracing::debug!(
+                    "{} Link to {} removed; reconnect hint: {:?}",
+                    self.name,
+                    zid,
+                    hint
+                );
+                if let Some(hinted) = hint {
+                    // The peer's own linkstate advertises its locators without loopback ones,
+                    // so a same-host peer listening on localhost leaves the graph node without
+                    // any; the remote ends of the lost links (recorded with the hint) are the
+                    // fallback: on the side that initiated the link that is the peer's listener.
+                    let mut locators = node.locators.clone().unwrap_or_default();
+                    let gossiped = self.gossiped_locators.get(zid).cloned().unwrap_or_default();
+                    for l in gossiped.into_iter().chain(hinted) {
+                        if !locators.contains(&l) {
+                            locators.push(l);
+                        }
+                    }
+                    let whatami = node.whatami.unwrap_or(WhatAmI::Peer);
+                    if locators.is_empty() {
+                        tracing::debug!(
+                            "{} Transport to {} {} lost unexpectedly but no locator is known; cannot reconnect",
+                            self.name,
+                            whatami,
+                            zid
+                        );
+                    } else if self.autoconnect.should_reconnect(whatami) {
+                        runtime.reconnect_peer(*zid, whatami, locators);
+                    } else {
+                        tracing::debug!(
+                            "{} Transport to {} {} lost unexpectedly; autoconnect does not cover {}s, not reconnecting",
+                            self.name,
+                            whatami,
+                            zid,
+                            whatami
+                        );
+                    }
+                }
+            }
         }
 
         vec![]

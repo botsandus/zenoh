@@ -205,6 +205,10 @@
       /// or different values for router or peer mode
       /// (e.g. autoconnect_strategy : { peer: { to_router:  "always", to_peer: "greater-zid" } }).
       autoconnect_strategy: { peer: { to_router: "always", to_peer: "always" } },
+      /// Whether a transport to a peer discovered through gossip is re-established (with the
+      /// "connect/retry" backoff, for up to a minute) when it ends unexpectedly: link error, lease
+      /// expiry, or the peer closing it as unresponsive. A peer that shuts down cleanly is not chased.
+      reconnect_on_close: true,
     },
   },
 

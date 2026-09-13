@@ -69,4 +69,12 @@ impl AutoConnect {
         };
         self.matcher.matches(what) && strategy()
     }
+
+    /// dexory: whether to re-establish a transport to `what` that was lost unexpectedly.
+    /// Only the type matcher applies: the strategy exists to keep both nodes from connecting
+    /// to each other at discovery, but after a loss only the side that noticed it (the one
+    /// holding a reconnect hint) retries, and a peer that cut us on purpose never does.
+    pub(crate) fn should_reconnect(&self, what: WhatAmI) -> bool {
+        self.matcher.matches(what)
+    }
 }
