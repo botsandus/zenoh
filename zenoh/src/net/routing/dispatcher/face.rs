@@ -15,7 +15,10 @@ use std::{
     any::Any,
     collections::HashMap,
     fmt::{self, Debug},
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc, Weak,
+    },
     time::Duration,
 };
 
@@ -124,6 +127,10 @@ pub struct FaceState {
     pub(crate) pending_current_interests: HashMap<InterestId, PendingCurrentInterest>,
     pub(crate) local_mappings: IntHashMap<ExprId, Arc<Resource>>,
     pub(crate) remote_mappings: IntHashMap<ExprId, Arc<Resource>>,
+    /// Last `ExprId` handed out by `get_next_local_id`; ids are allocated round-robin so that
+    /// an id released by `Resource::undeclare_unused_keys` is not reissued while the peer may
+    /// still reference it in messages already in flight.
+    pub(crate) next_local_expr_id: AtomicU16,
     pub(crate) next_qid: RequestId,
     /// Pending queries sent to this face.
     ///
@@ -165,6 +172,7 @@ impl FaceStateBuilder {
             pending_current_interests: HashMap::new(),
             local_mappings: IntHashMap::new(),
             remote_mappings: IntHashMap::new(),
+            next_local_expr_id: AtomicU16::new(0),
             next_qid: 0,
             pending_queries: HashMap::new(),
             mcast_group: None,
@@ -242,11 +250,21 @@ impl FaceState {
     }
 
     pub(crate) fn get_next_local_id(&self) -> ExprId {
-        let mut id = 1;
-        while self.local_mappings.contains_key(&id) || self.remote_mappings.contains_key(&id) {
-            id += 1;
+        // Round-robin over the id space rather than lowest-free: an id released by
+        // `Resource::undeclare_unused_keys` must not be handed out again while the peer may
+        // still use it (`Mapping::Receiver`) in messages already in flight, or those messages
+        // would be routed to the newly mapped key expression.
+        let mut id = self.next_local_expr_id.load(Ordering::Relaxed);
+        loop {
+            id = id.wrapping_add(1);
+            if id == 0 {
+                continue;
+            }
+            if !self.local_mappings.contains_key(&id) && !self.remote_mappings.contains_key(&id) {
+                self.next_local_expr_id.store(id, Ordering::Relaxed);
+                return id;
+            }
         }
-        id
     }
 
     pub(crate) fn update_interceptors_caches(&self, res: &mut Arc<Resource>) {

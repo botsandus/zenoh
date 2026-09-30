@@ -166,6 +166,7 @@ impl Face {
                             for hat in tables.hats.values_mut() {
                                 hat.unpropagate_token(ctx.reborrow(), res.clone());
                             }
+                            Resource::undeclare_unused_keys(tables, &mut res);
                             Resource::clean(&mut res);
                         }
                         [last_owner] if last_owner != &region => tables.hats[last_owner]

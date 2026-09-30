@@ -27,7 +27,10 @@ use zenoh_protocol::{
     core::{key_expr::keyexpr, ExprId, Region, WireExpr},
     network::{
         self,
-        declare::{self, queryable::ext::QueryableInfoType, Declare, DeclareBody, DeclareKeyExpr},
+        declare::{
+            self, queryable::ext::QueryableInfoType, Declare, DeclareBody, DeclareKeyExpr,
+            UndeclareKeyExpr,
+        },
         interest::InterestId,
         Mapping, RequestId,
     },
@@ -531,6 +534,76 @@ impl Resource {
         })
     }
 
+    /// Release the wire key-expression mappings that `decl_key` declared for this resource
+    /// on remote faces once nothing declares on it any more.
+    ///
+    /// `decl_key` interns the (non-wild prefix of the) key expression of every declaration it
+    /// propagates to a remote face, keeping the resource alive through
+    /// `FaceState::local_mappings` and never sending the matching `UndeclareKeyExpr`. Without
+    /// this the resource (and its counterpart on the peer, pinned by `remote_mappings`) stays
+    /// allocated until the face closes, i.e. every unique key expression ever declared by any
+    /// peer is retained forever on every peer. Undeclaring the mapping here lets `clean` drop
+    /// the resource locally and lets the peer drop it through `unregister_expr`.
+    ///
+    /// A resource counts as unused when it has no children, no subscriber, queryable or token
+    /// on any face, and no hat still knows a remote subscriber, queryable or token for it
+    /// (linkstate hats track those outside the face contexts). Callers must hold the tables
+    /// write lock; see `FaceState::get_next_local_id` for why a released id is not reissued
+    /// immediately.
+    pub(crate) fn undeclare_unused_keys(tables: &Tables, res: &mut Arc<Resource>) {
+        if !res.children.is_empty()
+            || res
+                .face_ctxs
+                .values()
+                .any(|ctx| ctx.subs.is_some() || ctx.qabl.is_some() || ctx.token)
+            || tables.hats.values().any(|hat| {
+                hat.remote_subscribers_of(&tables.data, res).is_some()
+                    || hat.remote_queryables_of(&tables.data, res).is_some()
+                    || hat.remote_tokens_of(&tables.data, res)
+            })
+        {
+            return;
+        }
+        let expr = res.expr().to_string();
+        let faces: Vec<FaceId> = res
+            .face_ctxs
+            .iter()
+            .filter(|(_, ctx)| ctx.local_expr_id.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for face_id in faces {
+            let mutres = get_mut_unchecked(res);
+            let Some(ctx) = mutres.face_ctxs.get_mut(&face_id) else {
+                continue;
+            };
+            let ctx = get_mut_unchecked(ctx);
+            let Some(expr_id) = ctx.local_expr_id.take() else {
+                continue;
+            };
+            let mut face = ctx.face.clone();
+            get_mut_unchecked(&mut face)
+                .local_mappings
+                .remove(&expr_id);
+            tracing::debug!(
+                "Undeclare key expression mapping {} ({}) on {}",
+                expr_id,
+                expr,
+                face
+            );
+            face.primitives.send_declare(RoutingContext::with_expr(
+                &mut Declare {
+                    interest_id: None,
+                    ext_qos: declare::ext::QoSType::DECLARE,
+                    ext_tstamp: None,
+                    ext_nodeid: declare::ext::NodeIdType::DEFAULT,
+                    body: DeclareBody::UndeclareKeyExpr(UndeclareKeyExpr { id: expr_id }),
+                },
+                expr.clone(),
+            ));
+            face.update_interceptors_caches(res);
+        }
+    }
+
     #[tracing::instrument(level = "trace")]
     pub fn clean(res: &mut Arc<Resource>) {
         let mut resclone = res.clone();
@@ -1032,6 +1105,7 @@ pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, ex
             hats[region].disable_data_routes(&mut res);
             hats[region].disable_query_routes(&mut res);
             face.update_interceptors_caches(&mut res);
+            Resource::undeclare_unused_keys(tables, &mut res);
             Resource::clean(&mut res);
         }
         None => tracing::error!("{} Undeclare unknown resource!", face),

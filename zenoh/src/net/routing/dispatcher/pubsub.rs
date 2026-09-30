@@ -121,6 +121,7 @@ impl Face {
                     for hat in tables.hats.values_mut() {
                         hat.unpropagate_subscriber(ctx.reborrow(), res.clone());
                     }
+                    Resource::undeclare_unused_keys(tables, &mut res);
                     Resource::clean(&mut res);
                 } else if let [last_owner] = &mut *remaining {
                     last_owner.unpropagate_last_non_owned_subscriber(ctx, res.clone())

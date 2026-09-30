@@ -177,6 +177,7 @@ impl Face {
                             for hat in tables.hats.values_mut() {
                                 hat.unpropagate_queryable(ctx.reborrow(), res.clone());
                             }
+                            Resource::undeclare_unused_keys(tables, &mut res);
                             Resource::clean(&mut res);
                         }
                         [(last_owner, _)] => tables.hats[last_owner]
