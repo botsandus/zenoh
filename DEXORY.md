@@ -1,9 +1,8 @@
 # Dexory Zenoh integration
 
-This private repository preserves Eclipse Zenoh history and carries a coordinated
-candidate for Hiroz, zenoh-router and rmw_zenoh. It is not an upstream fork in
-GitHub's fork network: public forks cannot be made private. Public contributions
-continue through botsandus/zenoh. Upstream licenses and notices are retained.
+This branch in the public botsandus/zenoh fork carries a coordinated candidate
+for Hiroz, zenoh-router and rmw_zenoh. Upstream licenses and notices are retained.
+Upstream contribution branches remain independent of this integration branch.
 
 The base is Zenoh **1.10.2**. `integration/patches.json` records every imported PR
 head and production backport. Each patch is a separate commit; the only manual
@@ -24,11 +23,8 @@ base-topic buffer-endpoint workaround and include upstream rmw_zenoh #994. The
 old core callback self-wait workaround is deliberately excluded because it
 weakens the callback-drain guarantee.
 
-Developers need read access to this repository. Configure Git authentication with
-`gh auth setup-git`, then set `CARGO_NET_GIT_FETCH_WITH_CLI=true`. CI needs an
-organization-approved read credential for this repository. Never put a token in
-a Cargo URL, Docker ARG, build context, or image. Private dependency sources can
-be fetched before packaging, or accessed through a BuildKit secret mount.
+The core source is public and requires no build credential. Use HTTPS git URLs
+with an immutable `rev`; never embed credentials in dependency URLs.
 
 ## Qualification
 
