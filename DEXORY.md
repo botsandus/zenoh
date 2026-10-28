@@ -39,8 +39,8 @@ together; an old cleanup implementation can still race a fixed creator.
 Core regression commands (Rust 1.93.0):
 
 ```sh
-cargo test --locked -p zenoh --no-default-features --features transport_tcp,transport_udp,shared-memory,unstable,internal --lib -- --test-threads=1
-cargo test --locked -p zenoh-ext --no-default-features --features unstable,zenoh/transport_tcp,zenoh/shared-memory --test reentrancy -- --test-threads=1
+cargo test --locked -p zenoh --no-default-features --features transport_tcp,transport_udp,shared-memory,unstable,internal,test --lib -- --test-threads=1
+cargo test --locked -p zenoh-ext --no-default-features --features unstable,zenoh/transport_tcp,zenoh/shared-memory --test reentrancy --test history_retry -- --test-threads=1
 cargo test --locked -p zenoh-shm --lib shm::unix::race_tests:: -- --test-threads=1
 cargo build --locked -p zenohd --features shared-memory
 ```
@@ -48,3 +48,19 @@ cargo build --locked -p zenohd --features shared-memory
 The reconnect experiment and broader SHM diagnostic logging are not required by
 the production baseline and are not carried here. Add any further fixes as
 separate commits with a reproducer and recorded validation.
+
+## Integration corrections
+
+Combining mapping reclamation (#2835) with sender-owned routes (#2879) exposed a
+second lifetime race: a cached route has no mapping lease after the table lock is
+released. This candidate routes data and queries using full key expressions.
+Control/declaration compression is retained; replies were already literal.
+The deterministic `routed_messages_survive_sender_mapping_reclamation_before_enqueue`
+regression retires the mapping between route selection and enqueue, for both
+puts and queries. This trades additional key-expression header bytes for correct
+routing during cleanup; throughput must be measured in the deployment soak.
+
+The production history retry backport now preserves `max_samples` and `max_age`,
+and rearms undelivered-history recovery when a retained sequenced source returns
+after liveliness loss. The `history_retry_preserves_max_age` regression verifies
+that an old cached sample stays excluded and a fresh publication is delivered.
