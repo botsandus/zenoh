@@ -2115,7 +2115,7 @@ fn test_push_message_consumption() {
         "k/0",
     );
     s1.declare_subscriber(None, 4, "k/0");
-    let sender_id = s2.recorder().with_messages(|messages| {
+    let _sender_id = s2.recorder().with_messages(|messages| {
         messages
             .iter()
             .find_map(|message| {
@@ -2148,12 +2148,8 @@ fn test_push_message_consumption() {
 
     assert_eq!(
         s2.recorder().pushes()[0].wire_expr,
-        WireExpr {
-            scope: sender_id,
-            suffix: "".into(),
-            mapping: Mapping::Sender
-        },
-        "s2's received publication should be scoped"
+        WireExpr::from("k/0"),
+        "queued routed publications must remain independent of mapping retirement"
     );
 
     assert_eq!(

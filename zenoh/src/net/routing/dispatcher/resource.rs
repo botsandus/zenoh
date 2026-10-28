@@ -11,9 +11,12 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(test)]
+use std::borrow::Cow;
+
 use std::{
     any::Any,
-    borrow::{Borrow, Cow},
+    borrow::Borrow,
     collections::VecDeque,
     convert::TryInto,
     fmt::Debug,
