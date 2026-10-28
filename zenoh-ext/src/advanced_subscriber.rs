@@ -1030,6 +1030,7 @@ const HISTORY_RETRY_POLL: Duration = Duration::from_secs(2);
 fn spawn_history_retry(
     statesref: &Arc<Mutex<State>>,
     source_id: EntityGlobalId,
+    history: HistoryConfig,
 ) -> AbortOnDropHandle<()> {
     // NOTE: the caller holds the `State` mutex; do not lock it here (the mutex
     // is not reentrant and this runs on the zenoh rx thread).
@@ -1157,7 +1158,7 @@ fn spawn_history_retry(
                 return;
             }
             if retry_now {
-                query_source_history(&statesref, source_id, Some(HISTORY_RETRY_QUERY_TIMEOUT));
+                query_source_history(&statesref, source_id, Some(HISTORY_RETRY_QUERY_TIMEOUT), Some(&history));
                 last_query = Instant::now();
                 wait = backoff;
                 backoff = (backoff * 2).min(HISTORY_RETRY_MAX);
@@ -1169,7 +1170,7 @@ fn spawn_history_retry(
 }
 
 fn periodic_query(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
-    query_source_history(statesref, source_id, None)
+    query_source_history(statesref, source_id, None, None)
 }
 
 /// Query the undelivered historical samples of one sequenced source.
@@ -1180,6 +1181,7 @@ fn query_source_history(
     statesref: &Arc<Mutex<State>>,
     source_id: EntityGlobalId,
     timeout_override: Option<Duration>,
+    history: Option<&HistoryConfig>,
 ) {
     let mut guard = statesref.lock().unwrap();
     let states = &mut *guard;
@@ -1194,7 +1196,18 @@ fn query_source_history(
         / &source_id.zid().into_keyexpr()
         / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
         / KE_STARSTAR;
-    let seq_num_range = seq_num_range(state.last_delivered.map(|s| s + 1), None);
+    let mut params = Parameters::from(seq_num_range(state.last_delivered.map(|s| s + 1), None));
+    if let Some(history) = history {
+        if let Some(max) = history.max_samples {
+            params.insert("_max", max.to_string());
+        }
+        if let Some(age) = history.max_age {
+            params.set_time_range(TimeRange {
+                start: TimeBound::Inclusive(TimeExpr::Now { offset_secs: -age }),
+                end: TimeBound::Unbounded,
+            });
+        }
+    }
 
     let session = states.session.clone();
     let key_expr = states.key_expr.clone().into_owned();
@@ -1205,7 +1218,7 @@ fn query_source_history(
         "AdvancedSubscriber{{key_expr: {}}}: Querying undelivered samples {}?{}",
         states.key_expr,
         query_expr,
-        seq_num_range
+        params
     );
     drop(guard);
 
@@ -1214,7 +1227,7 @@ fn query_source_history(
         statesref: statesref.clone(),
     };
     let _ = session
-        .get(Selector::from((query_expr, seq_num_range)))
+        .get(Selector::from((query_expr, params)))
         .callback({
             move |r: Reply| {
                 if let Ok(s) = r.into_result() {
@@ -1610,6 +1623,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                         states.sequenced_states.peek_mut(&source_id)
                                     {
                                         state.alive = false;
+                                        state.history_retry_task.take();
                                     }
                                     return;
                                 }
@@ -1638,8 +1652,17 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                         states.key_expr,
                                         source_id
                                     );
-                                    state.history_retry_task =
-                                        Some(spawn_history_retry(&statesref, source_id));
+                                }
+                                // A retained source may reappear after liveliness
+                                // loss; restart its retry task if it never delivered.
+                                if state.history_retry_task.is_none()
+                                    && state.last_delivered.is_none()
+                                {
+                                    state.history_retry_task = Some(spawn_history_retry(
+                                        &statesref,
+                                        source_id,
+                                        historyconf.clone(),
+                                    ));
                                 }
                                 state.pending_queries += 1;
                                 state.alive = true;
