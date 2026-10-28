@@ -774,16 +774,20 @@ impl Resource {
     /// If none is found, and if the tested resource itself doesn't have a declared keyexpr,
     /// then the parent tree is walked through. If there is still no declared keyexpr, the whole
     /// prefix+suffix string is used.
+    #[cfg(test)]
     pub fn get_best_key<'a>(&self, suffix: &'a str, sid: usize) -> WireExpr<'a> {
         self.get_best_key_with_receiver(suffix, sid, true)
     }
 
-    /// Data and queries may still be in flight when a receiver retires its own
-    /// mapping. Use a sender-owned scope, or a literal expression, instead.
-    pub fn get_best_sender_key<'a>(&self, suffix: &'a str, sid: usize) -> WireExpr<'a> {
-        self.get_best_key_with_receiver(suffix, sid, false)
+    /// Routed messages outlive the table read lock. Either endpoint can retire
+    /// a mapping before the message is enqueued, so keep the full expression.
+    /// Compression requires a mapping lease spanning route selection through
+    /// transport enqueue; cached Direction values currently hold no such lease.
+    pub fn get_best_sender_key<'a>(&self, suffix: &'a str, _sid: usize) -> WireExpr<'a> {
+        [&self.expr, suffix].concat().into()
     }
 
+    #[cfg(test)]
     fn get_best_key_with_receiver<'a>(
         &self,
         suffix: &'a str,

@@ -1115,8 +1115,8 @@ fn routed_data_and_queries_do_not_borrow_receiver_owned_mappings() {
     );
     assert_eq!(unowned.suffix, "owned/topic");
 
-    // An existing sender mapping remains usable: its lifetime belongs to this
-    // router face, which only clears local_mappings when the face closes.
+    // Sender mappings can also be retired by resource cleanup while a route
+    // snapshot is in flight. Their presence must not change the routed key.
     let sender_id = 42;
     let context = get_mut_unchecked(&mut res)
         .face_ctxs
@@ -1127,13 +1127,13 @@ fn routed_data_and_queries_do_not_borrow_receiver_owned_mappings() {
         .local_mappings
         .insert(sender_id, res.clone());
     let owned = routing.get_best_key(face.state.id).to_owned();
-    assert_eq!((owned.scope, owned.mapping), (sender_id, Mapping::Sender));
-    assert!(owned.suffix.is_empty());
+    assert_eq!(owned.scope, 0);
+    assert_eq!(owned.suffix, "owned/topic");
     let child = RoutingExpr::new(&res, "/child")
         .get_best_key(face.state.id)
         .to_owned();
-    assert_eq!((child.scope, child.mapping), (sender_id, Mapping::Sender));
-    assert_eq!(child.suffix, "/child");
+    assert_eq!(child.scope, 0);
+    assert_eq!(child.suffix, "owned/topic/child");
 
     unregister_expr(&router.tables, &mut face.state.clone(), 10);
     assert_eq!(routing.get_best_key(face.state.id), owned);

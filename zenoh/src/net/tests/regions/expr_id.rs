@@ -26,6 +26,104 @@ use zenoh_sync::get_mut_unchecked;
 use super::{try_init_tracing_subscriber, FaceDef, Harness, HarnessBuilder, Message, MockFace};
 use crate::net::primitives::Primitives;
 
+#[test]
+fn routed_messages_survive_sender_mapping_reclamation_before_enqueue() {
+    use std::sync::{Arc, Mutex};
+
+    use zenoh_protocol::{
+        core::Reliability,
+        network::{Interest, Push, Request, Response, ResponseFinal},
+    };
+
+    use crate::net::{primitives::EPrimitives, routing::RoutingContext};
+
+    struct RetireBeforeEnqueue {
+        original: Arc<dyn EPrimitives + Send + Sync>,
+        retire: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl RetireBeforeEnqueue {
+        fn retire(&self) {
+            if let Some(retire) = self.retire.lock().unwrap().take() {
+                retire();
+            }
+        }
+    }
+    impl EPrimitives for RetireBeforeEnqueue {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn send_interest(&self, ctx: RoutingContext<&mut Interest>) -> bool {
+            self.original.send_interest(ctx)
+        }
+        fn send_declare(&self, ctx: RoutingContext<&mut Declare>) -> bool {
+            self.original.send_declare(ctx)
+        }
+        fn send_push(&self, msg: &mut Push, reliability: Reliability) -> bool {
+            self.retire();
+            self.original.send_push(msg, reliability)
+        }
+        fn send_request(&self, msg: &mut Request) -> bool {
+            self.retire();
+            self.original.send_request(msg)
+        }
+        fn send_response(&self, msg: &mut Response) -> bool {
+            self.original.send_response(msg)
+        }
+        fn send_response_final(&self, msg: &mut ResponseFinal) -> bool {
+            self.original.send_response_final(msg)
+        }
+    }
+
+    for query in [false, true] {
+        let (_peer, router, session) = peer_with_router_face();
+        let session = Arc::new(session);
+        router.declare_subscriber(None, 1, "queued/**");
+        router.declare_queryable(None, 2, "queued/**", Default::default());
+        session.declare_token(None, 1, "queued/topic");
+        assert_eq!(local_mappings(&router), 1);
+
+        // The route has already selected its WireExpr and released the table
+        // lock when EPrimitives is called. Retire the only exact-key entity
+        // before enqueue, while the wildcard endpoints remain declared.
+        let original = {
+            let _tables = zwrite!(router.face.tables.tables);
+            let mut state = router.face.state.clone();
+            let state = get_mut_unchecked(&mut state);
+            let original = state.primitives.clone();
+            let retire_session = session.clone();
+            state.primitives = Arc::new(RetireBeforeEnqueue {
+                original: original.clone(),
+                retire: Mutex::new(Some(Box::new(move || retire_session.undeclare_token(1)))),
+            });
+            original
+        };
+        if query {
+            session.query(1, "queued/topic");
+        } else {
+            session.put("queued/topic", vec![42]);
+        }
+        {
+            let _tables = zwrite!(router.face.tables.tables);
+            get_mut_unchecked(&mut router.face.state.clone()).primitives = original;
+        }
+        assert_eq!(local_mappings(&router), 0, "cleanup must actually run");
+        let wire = if query {
+            let requests = router.recorder().requests();
+            assert_eq!(requests.len(), 1);
+            requests[0].wire_expr.clone()
+        } else {
+            let pushes = router.recorder().pushes();
+            assert_eq!(pushes.len(), 1);
+            pushes[0].wire_expr.clone()
+        };
+        assert_eq!(
+            wire.scope, EMPTY_EXPR_ID,
+            "queued message uses a retired sender mapping"
+        );
+        assert_eq!(wire.suffix, "queued/topic");
+    }
+}
+
 /// A peer gateway with one local session and one face towards a router, the shape of a
 /// ROS 2 process running rmw_zenoh in peer mode next to `rmw_zenohd`.
 fn peer_with_router_face() -> (Harness, MockFace, MockFace) {
