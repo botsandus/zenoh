@@ -1,0 +1,67 @@
+{
+  "upstream_version": "1.10.2",
+  "upstream_commit": "cc839802639e3b7ebea50990f7a819fe8990b0fe",
+  "upstream_patches": [
+    {
+      "pr": 2744,
+      "url": "https://github.com/eclipse-zenoh/zenoh/pull/2744",
+      "head": "281115610b1b5465490d6cb3c02273b85a5ab6e8",
+      "title": "fix(zenoh-ext): stop calling user code while holding subscriber state locks"
+    },
+    {
+      "pr": 2835,
+      "url": "https://github.com/eclipse-zenoh/zenoh/pull/2835",
+      "head": "2f6f3425e6925ad59abbd01878b2e4c80f68ca6a",
+      "title": "fix(routing): reclaim ExprIds and never spin on exhaustion (#2825)"
+    },
+    {
+      "pr": 2873,
+      "url": "https://github.com/eclipse-zenoh/zenoh/pull/2873",
+      "head": "0d1e20be0a7a13f63c0db02b8634ea81a10a31f2",
+      "title": "Fix Linux SHM segment creation and cleanup races"
+    },
+    {
+      "pr": 2875,
+      "url": "https://github.com/eclipse-zenoh/zenoh/pull/2875",
+      "head": "e791381a2fdd7d77a854fe9dd16fca63605d681f",
+      "title": "fix: release query timeout tasks when queries end"
+    },
+    {
+      "pr": 2876,
+      "url": "https://github.com/eclipse-zenoh/zenoh/pull/2876",
+      "head": "b915faf5e3dc26379dab9d854cfe99a6c3bee691",
+      "title": "fix: avoid reusing unsent key expression declarations"
+    },
+    {
+      "pr": 2877,
+      "url": "https://github.com/eclipse-zenoh/zenoh/pull/2877",
+      "head": "8d8636f336c5a8d09117db90306b63806499799c",
+      "title": "fix(routing): release broker declarations when their last interest ends"
+    },
+    {
+      "pr": 2878,
+      "url": "https://github.com/eclipse-zenoh/zenoh/pull/2878",
+      "head": "c58c4cacf9110ea1e653d6093ae9a251e4d6f589",
+      "title": "fix(routing): track discovery completion per active interest"
+    },
+    {
+      "pr": 2879,
+      "url": "https://github.com/eclipse-zenoh/zenoh/pull/2879",
+      "head": "2479133ab25403dab57b701655ccbf32e012c39a",
+      "title": "fix(routing): avoid receiver-owned mappings for data and queries"
+    }
+  ],
+  "production_backports": [
+    "b5e2f0b9b4e1cd4934947c447a1456c394b71b11",
+    "b8fff59caf70646b84ced1dad18c48f9459c5675"
+  ],
+  "superseded": [
+    "#2779 and #2883 are already in 1.10.2",
+    "7081f8b mapping cleanup is replaced by #2835",
+    "9ad4c9e callback self-wait workaround is excluded; consumers use rmw_zenoh #994"
+  ],
+  "excluded": [
+    "de5fccb reconnect experiment is not in the production baseline and is not included"
+  ],
+  "status": "integration candidate; qualification in progress"
+}
