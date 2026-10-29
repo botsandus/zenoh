@@ -697,6 +697,8 @@ pub(crate) struct SessionInner {
     state: RwLock<SessionState>,
     id: EntityId,
     task_controller: TaskController,
+    #[cfg(test)]
+    query_timer_count: Arc<std::sync::atomic::AtomicUsize>,
     face_id: OnceCell<usize>,
     pub(crate) callbacks_drop_sync_group: SyncGroup,
 }
@@ -884,6 +886,8 @@ impl Session {
                 state,
                 id: runtime.next_id(),
                 task_controller: TaskController::default(),
+                #[cfg(test)]
+                query_timer_count: Arc::default(),
                 face_id: OnceCell::new(),
                 callbacks_drop_sync_group: SyncGroup::default(),
             }));
@@ -1497,16 +1501,25 @@ impl Session {
             trace!("declare_prefix({:?})", prefix);
             let mut state = zwrite!(self.0.state);
             let primitives = state.primitives()?;
+            let pending_same_prefix = !force
+                && state
+                    .local_resources
+                    .values()
+                    .any(|res| !res.declared && res.resource.name() == prefix);
             match state
                 .local_resources
                 .iter_mut()
-                .find(|(_expr_id, res)| res.resource.name() == prefix)
+                // A resource is usable on the wire only after its declaration
+                // was sent. Another thread may still be sending an identical
+                // prefix: forced callers must declare their own mapping rather
+                // than referring to that pending mapping out of order.
+                .find(|(_expr_id, res)| res.declared && res.resource.name() == prefix)
             {
-                Some((expr_id, res)) if force || res.declared => {
+                Some((expr_id, res)) => {
                     res.count += 1;
                     Ok(Some(*expr_id))
                 }
-                Some(_) => Ok(None),
+                None if pending_same_prefix => Ok(None),
                 None => {
                     let expr_id = state.expr_id_counter.fetch_add(1, Ordering::SeqCst);
                     let mut res = Resource::new(Box::from(prefix));
@@ -2740,11 +2753,19 @@ impl Session {
             _ => 1,
         };
         let token = self.0.task_controller.get_cancellation_token();
+        // Each timer also belongs to its query. Final replies, cancellation and
+        // querier teardown remove the query; they must release a long-duration
+        // timeout task immediately instead of retaining it until session close.
+        let timeout_guard = token.clone().drop_guard();
+        #[cfg(test)]
+        let timer_count = QueryTimerCount::new(self.0.query_timer_count.clone());
         self.0
             .task_controller
             .spawn_with_rt(zenoh_runtime::ZRuntime::Net, {
                 let session = self.downgrade();
                 async move {
+                    #[cfg(test)]
+                    let _timer_count = timer_count;
                     tokio::select! {
                         _ = tokio::time::sleep(timeout) => {
                             let mut state = zwrite!(session.0.state);
@@ -2772,6 +2793,7 @@ impl Session {
         state.queries.insert(
             qid,
             QueryState {
+                _timeout_guard: timeout_guard,
                 nb_final,
                 key_expr: key_expr.key_expr().into(),
                 parameters: parameters.clone().into_owned(),
@@ -2871,10 +2893,12 @@ impl Session {
     #[cfg(feature = "unstable")]
     pub(crate) fn cancel_query(&self, qid: Id) -> ZResult<()> {
         tracing::debug!("Cancelling query: {qid}");
-        let mut state = zwrite!(self.0.state);
-        match state.queries.remove(&qid) {
-            Some(_) => bail!("Unable to find query {qid}"),
-            None => Ok(()),
+        // Release the session lock before dropping the callback: foreign
+        // drop handlers may re-enter the session.
+        let query = zwrite!(self.0.state).queries.remove(&qid);
+        match query {
+            Some(_) => Ok(()),
+            None => bail!("Unable to find query {qid}"),
         }
     }
 
@@ -2908,10 +2932,18 @@ impl Session {
             &mut callback,
         )?;
         let token = self.0.task_controller.get_cancellation_token();
+        // Each timer also belongs to its query. Final replies, cancellation and
+        // querier teardown remove the query; they must release a long-duration
+        // timeout task immediately instead of retaining it until session close.
+        let timeout_guard = token.clone().drop_guard();
+        #[cfg(test)]
+        let timer_count = QueryTimerCount::new(self.0.query_timer_count.clone());
         self.0.task_controller
             .spawn_with_rt(zenoh_runtime::ZRuntime::Net, {
                 let session = self.downgrade();
                 async move {
+                    #[cfg(test)]
+                    let _timer_count = timer_count;
                     tokio::select! {
                         _ = tokio::time::sleep(timeout) => {
                             let mut state = zwrite!(session.0.state);
@@ -2937,9 +2969,13 @@ impl Session {
 
         tracing::trace!("Register liveliness query {}", id);
         let wexpr = key_expr.to_wire(self).to_owned();
-        state
-            .liveliness_queries
-            .insert(id, LivelinessQueryState { callback });
+        state.liveliness_queries.insert(
+            id,
+            LivelinessQueryState {
+                _timeout_guard: timeout_guard,
+                callback,
+            },
+        );
         drop(state);
 
         primitives.send_interest(&mut Interest {
@@ -2958,10 +2994,10 @@ impl Session {
     #[cfg(feature = "unstable")]
     pub(crate) fn cancel_liveliness_query(&self, qid: Id) -> ZResult<()> {
         tracing::debug!("Cancelling liveliness query: {qid}");
-        let mut state = zwrite!(self.0.state);
-        match state.liveliness_queries.remove(&qid) {
-            Some(_) => bail!("Unable to find liveliness query {qid}"),
-            None => Ok(()),
+        let query = zwrite!(self.0.state).liveliness_queries.remove(&qid);
+        match query {
+            Some(_) => Ok(()),
+            None => bail!("Unable to find liveliness query {qid}"),
         }
     }
 
@@ -3759,5 +3795,489 @@ impl Closeable for Session {
 
     fn get_closee(&self) -> Self::TClosee {
         self.downgrade()
+    }
+}
+
+// Observe actual spawned timeout-future lifetimes without exposing production
+// introspection or relying on allocator/RSS heuristics in the regression tests.
+#[cfg(test)]
+struct QueryTimerCount(Arc<std::sync::atomic::AtomicUsize>);
+#[cfg(test)]
+impl QueryTimerCount {
+    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+#[cfg(test)]
+impl Drop for QueryTimerCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(test, feature = "unstable"))]
+mod query_timer_lifetime_tests {
+    use super::*;
+    use crate::net::primitives::{DummyPrimitives, Primitives};
+
+    // Hold remote protocol messages so completion, cancellation and expiry can
+    // be driven independently. All query construction and timer paths are real.
+    async fn isolated_session() -> (Session, Arc<dyn Primitives>) {
+        let mut config = crate::Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.scouting.gossip.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = crate::open(config).await.unwrap();
+        let original = zwrite!(session.0.state)
+            .primitives
+            .replace(Arc::new(DummyPrimitives))
+            .unwrap();
+        (session, original)
+    }
+
+    async fn timers_drained(session: &Session) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.0.query_timer_count.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed query retained its timeout task");
+    }
+
+    async fn close(session: Session, original: Arc<dyn Primitives>) {
+        zwrite!(session.0.state).primitives = Some(original);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_queries_release_unbounded_timeout_tasks() {
+        let (session, original) = isolated_session().await;
+        for _ in 0..128 {
+            let replies = session
+                .get("test/timer/completed")
+                .allowed_destination(Locality::Remote)
+                .timeout(Duration::from_millis(u64::MAX))
+                .wait()
+                .unwrap();
+            let id = *zread!(session.0.state).queries.keys().next().unwrap();
+            assert_eq!(session.0.query_timer_count.load(Ordering::SeqCst), 1);
+            session.downgrade().send_response_final(&mut ResponseFinal {
+                rid: id,
+                ext_qos: Default::default(),
+                ext_tstamp: None,
+            });
+            assert!(replies.recv_async().await.is_err());
+            timers_drained(&session).await;
+        }
+        close(session, original).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_queries_release_unbounded_timeout_tasks() {
+        let (session, original) = isolated_session().await;
+        let replies = session
+            .get("test/timer/canceled")
+            .allowed_destination(Locality::Remote)
+            .timeout(Duration::from_millis(u64::MAX))
+            .wait()
+            .unwrap();
+        let id = *zread!(session.0.state).queries.keys().next().unwrap();
+        assert_eq!(session.0.query_timer_count.load(Ordering::SeqCst), 1);
+        assert!(session.cancel_query(id).is_ok());
+        assert!(session.cancel_query(id).is_err());
+        assert!(replies.recv_async().await.is_err());
+        timers_drained(&session).await;
+        close(session, original).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_and_canceled_liveliness_queries_release_timeout_tasks() {
+        let (session, original) = isolated_session().await;
+        for cancel in [false, true] {
+            let replies = session
+                .liveliness()
+                .get("test/timer/liveliness")
+                .timeout(Duration::from_millis(u64::MAX))
+                .wait()
+                .unwrap();
+            let id = *zread!(session.0.state)
+                .liveliness_queries
+                .keys()
+                .next()
+                .unwrap();
+            assert_eq!(session.0.query_timer_count.load(Ordering::SeqCst), 1);
+            if cancel {
+                assert!(session.cancel_liveliness_query(id).is_ok());
+                assert!(session.cancel_liveliness_query(id).is_err());
+            } else {
+                session.downgrade().send_declare(&mut Declare {
+                    interest_id: Some(id),
+                    ext_qos: Default::default(),
+                    ext_tstamp: None,
+                    ext_nodeid: Default::default(),
+                    body: DeclareBody::DeclareFinal(DeclareFinal),
+                });
+            }
+            assert!(replies.recv_async().await.is_err());
+            timers_drained(&session).await;
+        }
+        close(session, original).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_cancellation_and_querier_drop_release_timeout_tasks() {
+        let (session, original) = isolated_session().await;
+        let cancellation = CancellationToken::default();
+        let replies = session
+            .get("test/timer/public_cancel")
+            .allowed_destination(Locality::Remote)
+            .timeout(Duration::from_millis(u64::MAX))
+            .cancellation_token(cancellation.clone())
+            .wait()
+            .unwrap();
+        let id = *zread!(session.0.state).queries.keys().next().unwrap();
+        assert_eq!(session.0.query_timer_count.load(Ordering::SeqCst), 1);
+        cancellation.cancel().await.unwrap();
+        assert!(replies.recv_async().await.is_err());
+        // A remote final can arrive after local cancellation, including when
+        // a one-reply caller cancels immediately after its successful response.
+        session.downgrade().send_response_final(&mut ResponseFinal {
+            rid: id,
+            ext_qos: Default::default(),
+            ext_tstamp: None,
+        });
+        assert!(zread!(session.0.state).queries.is_empty());
+        timers_drained(&session).await;
+
+        let querier = session
+            .declare_querier("test/timer/querier_drop")
+            .allowed_destination(Locality::Remote)
+            .timeout(Duration::from_millis(u64::MAX))
+            .wait()
+            .unwrap();
+        let replies = querier.get().wait().unwrap();
+        assert_eq!(session.0.query_timer_count.load(Ordering::SeqCst), 1);
+        drop(querier);
+        assert!(replies.recv_async().await.is_err());
+        assert!(zread!(session.0.state).queries.is_empty());
+        timers_drained(&session).await;
+        close(session, original).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_query_and_liveliness_timeout_still_fire() {
+        let (session, original) = isolated_session().await;
+        let timeout = Duration::from_millis(100);
+        let query = session
+            .get("test/timer/expiry")
+            .allowed_destination(Locality::Remote)
+            .timeout(timeout)
+            .wait()
+            .unwrap();
+        let liveliness = session
+            .liveliness()
+            .get("test/timer/expiry")
+            .timeout(timeout)
+            .wait()
+            .unwrap();
+        assert_eq!(session.0.query_timer_count.load(Ordering::SeqCst), 2);
+        assert!(query.try_recv().unwrap().is_none());
+        assert!(liveliness.try_recv().unwrap().is_none());
+        let (query_reply, live_reply) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(query.recv_async(), liveliness.recv_async())
+        })
+        .await
+        .unwrap();
+        assert!(query_reply.unwrap().into_result().is_err());
+        assert!(live_reply.unwrap().into_result().is_err());
+        assert!(zread!(session.0.state).queries.is_empty());
+        assert!(zread!(session.0.state).liveliness_queries.is_empty());
+        timers_drained(&session).await;
+        close(session, original).await;
+    }
+}
+
+#[cfg(test)]
+mod prefix_declaration_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_prefix_declaration_never_reuses_an_unsent_mapping() {
+        let mut config = crate::Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.scouting.gossip.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = crate::open(config).await.unwrap();
+        let prefix = "test/inflight/prefix";
+        let first = session
+            .declare_prefix(prefix, true)
+            .wait()
+            .unwrap()
+            .unwrap();
+        // Reproduce the state visible between inserting a resource and sending
+        // its DeclareKeyExpr. A concurrent forced declaration must not put this
+        // mapping on the wire until its declaration has been sent.
+        zwrite!(session.0.state)
+            .local_resources
+            .get_mut(&first)
+            .unwrap()
+            .declared = false;
+        assert_eq!(session.declare_prefix(prefix, false).wait().unwrap(), None);
+        let second = session
+            .declare_prefix(prefix, true)
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "reused a mapping whose declaration is still pending"
+        );
+        // Once an independently declared mapping exists it can be shared by
+        // both forced and opportunistic declarations.
+        assert_eq!(
+            session.declare_prefix(prefix, false).wait().unwrap(),
+            Some(second)
+        );
+        assert_eq!(
+            session.declare_prefix(prefix, true).wait().unwrap(),
+            Some(second)
+        );
+        session.undeclare_prefix(first).unwrap();
+        for _ in 0..3 {
+            session.undeclare_prefix(second).unwrap();
+        }
+        assert!(zread!(session.0.state).local_resources.is_empty());
+        session.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod prefix_ordering_tests {
+    use std::sync::{atomic::AtomicBool, mpsc, Mutex};
+
+    use zenoh_protocol::{core::Reliability, network::Push};
+
+    use super::*;
+    use crate::net::primitives::Primitives;
+
+    struct HoldFirstDeclaration {
+        entered: mpsc::Sender<ExprId>,
+        release: Mutex<mpsc::Receiver<()>>,
+        held: AtomicBool,
+        sent: Mutex<Vec<ExprId>>,
+    }
+
+    impl Primitives for HoldFirstDeclaration {
+        fn send_declare(&self, msg: &mut Declare) {
+            if let DeclareBody::DeclareKeyExpr(declaration) = &msg.body {
+                if !self.held.swap(true, Ordering::SeqCst) {
+                    self.entered.send(declaration.id).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                self.sent.lock().unwrap().push(declaration.id);
+            }
+        }
+        fn send_interest(&self, _: &mut Interest) {}
+        fn send_push_consume(&self, _: &mut Push, _: Reliability, _: bool) {}
+        fn send_request(&self, _: &mut Request) {}
+        fn send_response(&self, _: &mut Response) {}
+        fn send_response_final(&self, _: &mut ResponseFinal) {}
+        fn send_close(&self) {}
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_keyexpr_is_declared_before_it_can_be_used() {
+        let mut config = crate::Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.scouting.gossip.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = crate::open(config).await.unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let primitives = Arc::new(HoldFirstDeclaration {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            held: AtomicBool::new(false),
+            sent: Mutex::new(Vec::new()),
+        });
+        let original = zwrite!(session.0.state)
+            .primitives
+            .replace(primitives.clone())
+            .unwrap();
+        let first_session = session.clone();
+        let first = std::thread::spawn(move || {
+            first_session
+                .declare_keyexpr("test/concurrent/prefix")
+                .wait()
+                .unwrap()
+        });
+        // Pause after the first mapping is registered but before its declaration
+        // reaches the wire. The second public declaration runs concurrently.
+        let pending_id = entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = session
+            .declare_keyexpr("test/concurrent/prefix")
+            .wait()
+            .unwrap();
+        let scope = second.to_wire(&session).scope;
+        let sent_before_return = primitives.sent.lock().unwrap().clone();
+        // Unblock and join even on the broken implementation before asserting.
+        release_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        drop(first);
+        drop(second);
+        zwrite!(session.0.state).primitives = Some(original);
+        session.close().await.unwrap();
+        assert_ne!(scope, pending_id, "returned an unsent concurrent mapping");
+        assert!(
+            sent_before_return.contains(&scope),
+            "returned before sending its key expression declaration"
+        );
+    }
+}
+
+#[cfg(test)]
+mod routed_mapping_lifetime_tests {
+    use std::sync::Mutex;
+
+    use zenoh_protocol::{
+        core::Reliability,
+        network::Push,
+        zenoh::{PushBody, Put, Query, RequestBody},
+    };
+    use zenoh_sync::get_mut_unchecked;
+
+    use super::*;
+    use crate::net::{
+        primitives::{DummyPrimitives, EPrimitives, Primitives},
+        routing::RoutingContext,
+    };
+
+    struct QueuedDelivery {
+        original: Arc<dyn EPrimitives + Send + Sync>,
+        pushes: Mutex<Vec<Push>>,
+        requests: Mutex<Vec<Request>>,
+    }
+    impl EPrimitives for QueuedDelivery {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn send_interest(&self, ctx: RoutingContext<&mut Interest>) -> bool {
+            self.original.send_interest(ctx)
+        }
+        fn send_declare(&self, ctx: RoutingContext<&mut Declare>) -> bool {
+            self.original.send_declare(ctx)
+        }
+        fn send_push(&self, msg: &mut Push, _: Reliability) -> bool {
+            self.pushes.lock().unwrap().push(msg.clone());
+            false
+        }
+        fn send_request(&self, msg: &mut Request) -> bool {
+            self.requests.lock().unwrap().push(msg.clone());
+            false
+        }
+        fn send_response(&self, msg: &mut Response) -> bool {
+            self.original.send_response(msg)
+        }
+        fn send_response_final(&self, msg: &mut ResponseFinal) -> bool {
+            self.original.send_response_final(msg)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_data_and_queries_survive_receiver_keyexpr_undeclaration() {
+        let mut config = crate::Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.scouting.gossip.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let receiver = crate::open(config).await.unwrap();
+        let subscriber = receiver.declare_subscriber("mapping/**").await.unwrap();
+        let queryable = receiver
+            .declare_queryable("mapping/**")
+            .complete(true)
+            .await
+            .unwrap();
+        let key = receiver.declare_keyexpr("mapping/topic").await.unwrap();
+        let retired_id = key.to_wire(&receiver).scope;
+        assert_ne!(retired_id, 0);
+        let gateway = receiver.static_runtime().unwrap().router();
+        let face_id = *receiver.0.face_id.get().unwrap();
+        // Delay only delivered data/queries, modeling messages already in flight.
+        // Control messages and both mapping tables use the real implementation.
+        let queued = {
+            let mut tables = gateway.tables.tables.write().unwrap();
+            let face = get_mut_unchecked(tables.data.faces.get_mut(&face_id).unwrap());
+            let queued = Arc::new(QueuedDelivery {
+                original: face.primitives.clone(),
+                pushes: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+            });
+            face.primitives = queued.clone();
+            queued
+        };
+        let source = gateway.new_session(Arc::new(DummyPrimitives));
+        source.send_push(
+            &mut Push {
+                wire_expr: "mapping/topic".into(),
+                ext_qos: Default::default(),
+                ext_tstamp: None,
+                ext_nodeid: Default::default(),
+                ext_ts_stack: None,
+                payload: PushBody::Put(Put {
+                    payload: vec![42].into(),
+                    ..Default::default()
+                }),
+            },
+            Reliability::Reliable,
+        );
+        source.send_request(&mut Request {
+            id: 1,
+            wire_expr: "mapping/topic".into(),
+            ext_qos: Default::default(),
+            ext_tstamp: None,
+            ext_nodeid: Default::default(),
+            ext_target: Default::default(),
+            ext_budget: None,
+            ext_timeout: None,
+            ext_ts_stack: None,
+            payload: RequestBody::Query(Query::default()),
+        });
+        let mut pushes = std::mem::take(&mut *queued.pushes.lock().unwrap());
+        let mut requests = std::mem::take(&mut *queued.requests.lock().unwrap());
+        assert_eq!((pushes.len(), requests.len()), (1, 1));
+        drop(key);
+        assert!(!zread!(receiver.0.state)
+            .local_resources
+            .contains_key(&retired_id));
+        for push in &mut pushes {
+            queued.original.send_push(push, Reliability::Reliable);
+        }
+        for request in &mut requests {
+            queued.original.send_request(request);
+        }
+        let got_sample = subscriber.try_recv().unwrap().is_some();
+        let got_query = queryable.try_recv().unwrap().is_some();
+        {
+            let mut tables = gateway.tables.tables.write().unwrap();
+            get_mut_unchecked(tables.data.faces.get_mut(&face_id).unwrap()).primitives =
+                queued.original.clone();
+        }
+        source.send_close();
+        drop(subscriber);
+        drop(queryable);
+        receiver.close().await.unwrap();
+        assert_eq!(
+            (got_sample, got_query),
+            (true, true),
+            "in-flight messages used a key expression already retired by their receiver"
+        );
     }
 }

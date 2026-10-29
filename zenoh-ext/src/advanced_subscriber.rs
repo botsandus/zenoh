@@ -12,7 +12,13 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use std::{
-    cmp::min, collections::BTreeMap, fmt, future::IntoFuture, hash::Hash, str::FromStr, sync::Weak,
+    cmp::min,
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    future::IntoFuture,
+    hash::Hash,
+    str::FromStr,
+    sync::{Condvar, Weak},
     time::Instant,
 };
 
@@ -450,6 +456,15 @@ struct State {
     callback: Option<Callback<Sample>>,
     miss_handlers: HashMap<usize, Callback<Miss>>,
     token: Option<LivelinessToken>,
+    /// Calls into user code staged by the state machine, in the order it
+    /// produced them. Drained by `dispatch_outbox` with this mutex released.
+    outbox: VecDeque<Call>,
+    /// Which thread, if any, is draining `outbox`. One at a time, which keeps
+    /// delivery ordered and mutually excluded. An id rather than a bool so
+    /// `wait_for_delivery` can tell its own delivery apart and not wait on it.
+    delivering: Option<std::thread::ThreadId>,
+    /// Signalled when `delivering` clears. `wait_callbacks` blocks on it.
+    delivery_done: Arc<Condvar>,
     _gc_task: AbortOnDropHandle<()>,
 }
 
@@ -462,9 +477,14 @@ impl State {
         self.miss_handlers.insert(id, callback);
         id
     }
+    /// Removes a miss callback, returning it to be dropped by the caller.
+    ///
+    /// The caller drops it **after** releasing `statesref`: dropping a user
+    /// callback runs user `Drop` code, which is a call-out like any other.
     #[zenoh_macros::unstable]
-    fn unregister_miss_callback(&mut self, id: &usize) {
-        self.miss_handlers.remove(id);
+    #[must_use = "drop the callback outside the state lock"]
+    fn unregister_miss_callback(&mut self, id: &usize) -> Option<Callback<Miss>> {
+        self.miss_handlers.remove(id)
     }
 }
 
@@ -477,6 +497,10 @@ struct SourceState<T> {
     latest_access: Instant,
     /// Periodic queries task
     periodic_task: Option<AbortOnDropHandle<()>>,
+    /// History re-query watchdog: re-issues the historical-data query, with
+    /// backoff, while the publisher is alive but has delivered nothing yet.
+    /// See [`spawn_history_retry`].
+    history_retry_task: Option<AbortOnDropHandle<()>>,
     /// Alive as per liveliness subscriber
     alive: bool,
 }
@@ -488,6 +512,7 @@ impl<T> Default for SourceState<T> {
             pending_queries: 0,
             pending_samples: BTreeMap::new(),
             periodic_task: None,
+            history_retry_task: None,
             alive: false,
             latest_access: Instant::now(),
         }
@@ -601,9 +626,233 @@ impl<Receiver> std::ops::DerefMut for AdvancedSubscriber<Receiver> {
     }
 }
 
+/// One deferred call into user code.
+///
+/// Each variant carries its own target, at the cost of a handle clone per call:
+/// staging is a commitment to deliver, and an undeclare landing before the drain
+/// would otherwise take `State::callback` away and discard the sample.
+///
+/// `clippy::large_enum_variant` wants `Sample` (~272 bytes, against `Miss`'s
+/// ~56) boxed. That trades a queue slot for a heap allocation on every delivered
+/// sample, to save memory in a queue that is empty whenever delivery keeps up.
+#[zenoh_macros::unstable]
+#[allow(clippy::large_enum_variant)]
+enum Call {
+    /// A sample for the subscriber's own callback.
+    Sample(Callback<Sample>, Sample),
+    /// A miss report for one specific miss listener.
+    Miss(Callback<Miss>, Miss),
+}
+
+/// Marks the calling thread as the one draining [`State::outbox`].
+///
+/// RAII, so the marker clears even if a user callback unwinds; otherwise the
+/// subscriber would stop delivering for the rest of its life.
+#[zenoh_macros::unstable]
+struct DeliveringRole<'a> {
+    statesref: &'a Arc<Mutex<State>>,
+    released: bool,
+}
+
+#[zenoh_macros::unstable]
+impl DeliveringRole<'_> {
+    /// Gives up the role.
+    ///
+    /// Takes the live borrow so the empty-outbox test and the release are one
+    /// atomic step: split them, and a call staged in between sits in the outbox
+    /// until some later call flushes it.
+    fn release(&mut self, states: &mut State) {
+        states.delivering = None;
+        states.delivery_done.notify_all();
+        self.released = true;
+    }
+}
+
+#[zenoh_macros::unstable]
+impl Drop for DeliveringRole<'_> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        // Only reached when a user callback unwound. Not `zlock!`: unwrapping a
+        // poisoned mutex here would panic in a destructor, which aborts.
+        //
+        // The outbox is emptied, not left. `wait_for_delivery` waits on a
+        // non-empty outbox because a staging thread is always on its way to
+        // drain it — untrue here, where this thread was the drainer, so anything
+        // staged during the callback would wedge the next `wait_callbacks`.
+        // Undeliverable from an unwinding destructor, and a panicking callback
+        // used to poison this mutex and lose them anyway.
+        let calls = {
+            let states = &mut *match self.statesref.lock() {
+                Ok(states) => states,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            states.delivering = None;
+            states.delivery_done.notify_all();
+            std::mem::take(&mut states.outbox)
+        };
+        // Guard released, and `catch_unwind`: the last `Callback` clone drops
+        // user code, which must not re-enter the lock nor panic mid-unwind.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(calls)));
+    }
+}
+
+/// Delivers everything staged in [`State::outbox`], with the lock released.
+///
+/// The only place in this file that invokes a callback. Callers stage while
+/// holding `statesref` and come here once the guard is gone, so a callback that
+/// re-enters an `AdvancedSubscriber` API — `SampleMissListener::drop` and
+/// `SampleMissListenerBuilder::wait` both take `statesref` — cannot deadlock
+/// against its own caller's guard.
+///
+/// Dropping a `Callback` also runs user code; those sites release the guard
+/// first instead — see `unregister_miss_callback` and the drop callback.
+///
+/// One shared FIFO, one active deliverer. Per-call-site buffers would fix the
+/// deadlock and break ordering: `Callback` is `Send + Sync`, so two threads can
+/// advance the state to sn=5 and sn=6 and deliver them out of order. A thread
+/// that finds another draining stages and returns; the deliverer takes the work
+/// on its next lap, so callbacks stay mutually excluded as before.
+///
+/// Two consequences worth knowing. A re-entrant publish is safe only if it is
+/// *conditional* — republishing on every sample refills the outbox as fast as
+/// the loop drains it, livelock where it used to deadlock. And the outbox is not
+/// backpressure: the mutex used to throttle producers, staging does not, and
+/// nothing bounds the queue. Bounding it means dropping samples or restoring a
+/// block, both larger changes than removing the deadlock.
+#[zenoh_macros::unstable]
+fn dispatch_outbox(statesref: &Arc<Mutex<State>>) {
+    // Drained into across laps rather than taking the outbox itself, so both
+    // buffers keep their capacity instead of being freed and reallocated once
+    // per batch — which, when delivery keeps up and a batch is one call, is once
+    // per sample.
+    let mut calls: Vec<Call> = Vec::new();
+    // Claim the role and take the first batch in one acquisition.
+    {
+        let states = &mut *zlock!(statesref);
+        if states.delivering.is_some() || states.outbox.is_empty() {
+            return;
+        }
+        states.delivering = Some(std::thread::current().id());
+        calls.extend(states.outbox.drain(..));
+    }
+    let mut role = DeliveringRole {
+        statesref,
+        released: false,
+    };
+    loop {
+        for call in calls.drain(..) {
+            match call {
+                Call::Sample(callback, sample) => callback.call(sample),
+                Call::Miss(miss_callback, miss) => miss_callback.call(miss),
+            }
+        }
+        // Braced so the guard's scope is explicit: no user code may run inside.
+        {
+            let states = &mut *zlock!(statesref);
+            if states.outbox.is_empty() {
+                role.release(states);
+                return;
+            }
+            calls.extend(states.outbox.drain(..));
+        }
+    }
+}
+
+/// Blocks until every call another thread has committed to has been delivered.
+///
+/// `wait_callbacks` was a no-op while a running callback held the state lock:
+/// acquiring it was proof none was running. Callbacks now run unlocked, so the
+/// wait has to be explicit.
+///
+/// Waiting on `delivering` alone is not enough. A staging thread releases the
+/// guard before claiming the role, so `delivering` is `None` while the outbox
+/// still holds committed calls, and each carries its own callback handle —
+/// unregistering first does not stop it. So a non-empty outbox counts as
+/// outstanding, which is safe because every staging site calls `dispatch_outbox`
+/// on the way out. The exception is a callback unwinding, which is why
+/// `DeliveringRole::drop` empties the outbox.
+///
+/// Never waits on this thread's own delivery: a callback that undeclares while
+/// being delivered would otherwise block on itself — the original defect in
+/// another hat.
+///
+/// The wait is per-subscriber, not per-listener. `wait_callbacks` on a miss
+/// listener also waits out any sample callback in flight; the outbox interleaves
+/// both, so a listener's misses cannot be waited for in isolation.
+#[zenoh_macros::unstable]
+fn wait_for_delivery(statesref: &Arc<Mutex<State>>) {
+    let me = std::thread::current().id();
+    // Deliberately not `zlock!`. The subscriber's drop callback calls this, and
+    // that runs inside `CallbackDrop`'s destructor — unwrapping a poisoned mutex
+    // there is a panic in a `Drop`, which aborts the process. The wait loop below
+    // already treats poisoning as "nothing to wait for"; so does this.
+    let Ok(mut guard) = statesref.lock() else {
+        return;
+    };
+    let condvar = guard.delivery_done.clone();
+    loop {
+        match guard.delivering {
+            // Ours. Waiting would be waiting on ourselves.
+            Some(owner) if owner == me => return,
+            // Someone else is mid-drain.
+            Some(_) => {}
+            // Nobody has claimed the role, and nothing is staged: quiescent.
+            None if guard.outbox.is_empty() => return,
+            // Staged but unclaimed — the staging thread is on its way in.
+            None => {}
+        }
+        guard = match condvar.wait(guard) {
+            Ok(guard) => guard,
+            // Poisoned: some other thread panicked holding the state. There is
+            // nothing to wait for and nothing useful to do here.
+            Err(_) => return,
+        };
+    }
+}
+
+/// Stages `sample` for delivery to `callback`.
+#[zenoh_macros::unstable]
+#[inline]
+fn stage_sample(outbox: &mut VecDeque<Call>, callback: &Callback<Sample>, sample: Sample) {
+    outbox.push_back(Call::Sample(callback.clone(), sample));
+}
+
+/// Stages `miss` for delivery to one miss listener.
+#[zenoh_macros::unstable]
+#[inline]
+fn stage_miss(outbox: &mut VecDeque<Call>, callback: &Callback<Miss>, miss: Miss) {
+    outbox.push_back(Call::Miss(callback.clone(), miss));
+}
+
+/// Feeds a queried-back sample through the state machine, then delivers.
+///
+/// Every reply callback in this file does exactly this, so they all route
+/// through here: the release-before-call obligation is stated once rather than
+/// copied seven times, which is one fewer place for it to be forgotten.
+#[zenoh_macros::unstable]
+fn handle_reply_sample(statesref: &Arc<Mutex<State>>, sample: Sample) {
+    {
+        let states = &mut *zlock!(statesref);
+        tracing::trace!(
+            "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
+            states.key_expr,
+            sample.source_info(),
+            sample.timestamp()
+        );
+        handle_sample(states, sample);
+    }
+    dispatch_outbox(statesref);
+}
+
 #[zenoh_macros::unstable]
 fn handle_sample(states: &mut State, sample: Sample) -> bool {
-    let Some(callback) = states.callback.as_ref() else {
+    // Cloned once per call, not once per staged sample, and owned so that it does
+    // not borrow `states` across the state walk. Staging it with each sample is
+    // what makes a sample that got this far certain to be delivered, even if the
+    // subscriber is undeclared before the outbox is drained.
+    let Some(callback) = states.callback.clone() else {
         return false;
     };
     if let Some(source_info) = sample.source_info().cloned() {
@@ -611,14 +860,15 @@ fn handle_sample(states: &mut State, sample: Sample) -> bool {
         fn deliver_and_flush(
             sample: Sample,
             source_sn: impl Into<WrappingSn>,
-            callback: &Callback<Sample>,
             state: &mut SourceState<WrappingSn>,
+            callback: &Callback<Sample>,
+            outbox: &mut VecDeque<Call>,
         ) {
             let mut source_sn = source_sn.into();
-            callback.call(sample);
+            stage_sample(outbox, callback, sample);
             state.last_delivered = Some(source_sn);
             while let Some(sample) = state.pending_samples.remove(&(source_sn + 1)) {
-                callback.call(sample);
+                stage_sample(outbox, callback, sample);
                 source_sn += 1;
                 state.last_delivered = Some(source_sn);
             }
@@ -635,14 +885,14 @@ fn handle_sample(states: &mut State, sample: Sample) -> bool {
             // Avoid going through the Map if history_depth == 1
             if states.max_history_depth == 1 {
                 state.last_delivered = Some(source_info.source_sn().into());
-                callback.call(sample);
+                stage_sample(&mut states.outbox, &callback, sample);
             } else {
                 state
                     .pending_samples
                     .insert(source_info.source_sn().into(), sample);
                 if state.pending_samples.len() >= states.max_history_depth {
                     if let Some((sn, sample)) = state.pending_samples.pop_first() {
-                        deliver_and_flush(sample, sn, callback, state);
+                        deliver_and_flush(sample, sn, state, &callback, &mut states.outbox);
                     }
                 }
             }
@@ -661,17 +911,27 @@ fn handle_sample(states: &mut State, sample: Sample) -> bool {
                         source_info.source_id(),
                     );
                     for miss_callback in states.miss_handlers.values() {
-                        miss_callback.call(Miss {
-                            source: *source_info.source_id(),
-                            nb: source_info.source_sn() - state.last_delivered.unwrap() - 1,
-                        });
+                        stage_miss(
+                            &mut states.outbox,
+                            miss_callback,
+                            Miss {
+                                source: *source_info.source_id(),
+                                nb: source_info.source_sn() - state.last_delivered.unwrap() - 1,
+                            },
+                        );
                     }
-                    callback.call(sample);
+                    stage_sample(&mut states.outbox, &callback, sample);
                     state.last_delivered = Some(source_info.source_sn().into());
                 }
             }
         } else {
-            deliver_and_flush(sample, source_info.source_sn(), callback, state);
+            deliver_and_flush(
+                sample,
+                source_info.source_sn(),
+                state,
+                &callback,
+                &mut states.outbox,
+            );
         }
         state.latest_access = Instant::now();
         new
@@ -684,18 +944,18 @@ fn handle_sample(states: &mut State, sample: Sample) -> bool {
                 || states.max_history_depth == 1
             {
                 state.last_delivered = Some(*timestamp);
-                callback.call(sample);
+                stage_sample(&mut states.outbox, &callback, sample);
             } else {
                 state.pending_samples.entry(*timestamp).or_insert(sample);
                 if state.pending_samples.len() >= states.max_history_depth {
-                    flush_timestamped_source(state, Some(callback));
+                    flush_timestamped_source(state, &callback, &mut states.outbox);
                 }
             }
         }
         state.latest_access = Instant::now();
         false
     } else {
-        callback.call(sample);
+        stage_sample(&mut states.outbox, &callback, sample);
         false
     }
 }
@@ -730,7 +990,199 @@ fn spawn_periodic_queries(
     )))
 }
 
+/// Initial delay before the first history re-query for a source that has
+/// delivered nothing; doubled after every attempt up to [`HISTORY_RETRY_MAX`].
+const HISTORY_RETRY_INITIAL: Duration = Duration::from_secs(2);
+/// Upper bound on the history re-query backoff.
+const HISTORY_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Timeout applied to retried history queries. The configured `query_timeout`
+/// may be unbounded (rmw_zenoh uses `u64::MAX`); a finite timeout here keeps
+/// the retry loop progressing even if an earlier query is never finalized.
+const HISTORY_RETRY_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// If a history query for a source has been outstanding this long without
+/// delivering anything, treat it as hung (its reply or ResponseFinal was lost)
+/// and issue a retry alongside it rather than waiting on it forever. A large
+/// latched sample completes in a few seconds when the transport is healthy.
+const HISTORY_RETRY_STALL: Duration = Duration::from_secs(15);
+/// Poll period of the history-retry watchdog while it is waiting on an
+/// in-flight query.
+const HISTORY_RETRY_POLL: Duration = Duration::from_secs(2);
+
+/// Re-query a publisher's history, with capped backoff, until something is delivered.
+///
+/// A TRANSIENT_LOCAL publisher hands its latched samples to a late-joining
+/// subscriber through a one-shot query issued when the publisher is
+/// discovered. If that single reply is lost -- e.g. a large sample blocking
+/// past `wait_before_close` and closing the transport under startup churn --
+/// the query finalizes with zero samples and nothing re-asks: periodic
+/// re-queries only run when `periodic_queries` is configured (rmw_zenoh uses
+/// heartbeat recovery instead), and a sporadic heartbeat is only emitted after
+/// a *new* publication, never for a sample latched long before the subscriber
+/// existed. The subscriber therefore never receives the latched sample.
+///
+/// This task keeps re-querying the source while it is still alive (liveliness
+/// token present) and has delivered nothing. It exits as soon as any sample is
+/// delivered, or the publisher's token is deleted. To avoid requesting a large
+/// reply twice while a slow transfer is in flight, it only retries once the
+/// previous query has finalized, unless that query has stalled for
+/// [`HISTORY_RETRY_STALL`].
+#[zenoh_macros::unstable]
+fn spawn_history_retry(
+    statesref: &Arc<Mutex<State>>,
+    source_id: EntityGlobalId,
+    history: HistoryConfig,
+) -> AbortOnDropHandle<()> {
+    // NOTE: the caller holds the `State` mutex; do not lock it here (the mutex
+    // is not reentrant and this runs on the zenoh rx thread).
+    //
+    // Hold only a `Weak` to the state: the task's handle lives inside the
+    // state, so a strong reference would form a cycle that keeps a dropped
+    // subscriber's state (and this task) alive forever. With a `Weak`, dropping
+    // the subscriber drops the state, which drops the handle and aborts us.
+    let weak = Arc::downgrade(statesref);
+    AbortOnDropHandle::new(ZRuntime::Application.spawn(async move {
+        tracing::debug!(
+            "History-retry watchdog task started for publisher {:?}",
+            source_id
+        );
+        // Time since the last history query was (re)issued for this source; the
+        // first query is the one issued by the caller right after arming.
+        let mut last_query = Instant::now();
+        let mut backoff = HISTORY_RETRY_INITIAL;
+        let mut wait = HISTORY_RETRY_INITIAL;
+        loop {
+            tokio::time::sleep(wait).await;
+            tracing::trace!(
+                "History-retry watchdog tick for publisher {:?} (slept {:?})",
+                source_id,
+                wait
+            );
+            let Some(statesref) = weak.upgrade() else {
+                tracing::debug!(
+                    "History-retry watchdog for {:?} exiting: subscriber dropped",
+                    source_id
+                );
+                return;
+            };
+            // Set when buffered samples were flushed (staged) under the lock; the
+            // outbox is dispatched below, once the lock is released.
+            let mut flushed = false;
+            let retry_now = {
+                // Never block the (single-threaded) application runtime on this
+                // mutex: if it is contended -- or wedged by a stuck callback --
+                // skip this tick and look again later.
+                let mut guard = match statesref.try_lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        tracing::trace!(
+                            "History-retry watchdog for {:?}: state busy, skipping tick",
+                            source_id
+                        );
+                        wait = HISTORY_RETRY_POLL;
+                        continue;
+                    }
+                };
+                let states = &mut *guard;
+                // peek_mut so a source with no samples can still be garbage collected
+                let Some(state) = states.sequenced_states.peek_mut(&source_id) else {
+                    tracing::debug!(
+                        "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog for {:?} exiting: source state gone",
+                        states.key_expr,
+                        source_id
+                    );
+                    return;
+                };
+                if !state.alive || state.last_delivered.is_some() {
+                    tracing::debug!(
+                        "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog for {:?} exiting: alive={} delivered={}",
+                        states.key_expr,
+                        source_id,
+                        state.alive,
+                        state.last_delivered.is_some()
+                    );
+                    return;
+                }
+                let stalled = last_query.elapsed() >= HISTORY_RETRY_STALL;
+                // Samples arrived but are held back waiting for pending queries to
+                // finalize. If those queries have stalled (reply/final lost) they
+                // never will: flush what we have rather than hold it hostage.
+                if !state.pending_samples.is_empty() {
+                    if stalled {
+                        tracing::debug!(
+                            "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog for {:?}: {} buffered sample(s) stuck behind {} stalled query(ies), flushing",
+                            states.key_expr,
+                            source_id,
+                            state.pending_samples.len(),
+                            state.pending_queries
+                        );
+                        if let Some(callback) = states.callback.clone() {
+                            flush_sequenced_source(
+                                state,
+                                &callback,
+                                &source_id,
+                                &states.miss_handlers,
+                                &mut states.outbox,
+                            );
+                        }
+                        flushed = true;
+                        false
+                    } else {
+                        false
+                    }
+                } else if state.pending_queries > 0 && !stalled {
+                    // A query is still in flight: let it finish rather than
+                    // requesting the (possibly large) history a second time.
+                    tracing::trace!(
+                        "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog for {:?}: {} query(ies) in flight for {:?}, waiting",
+                        states.key_expr,
+                        source_id,
+                        state.pending_queries,
+                        last_query.elapsed()
+                    );
+                    false
+                } else {
+                    tracing::debug!(
+                        "AdvancedSubscriber{{key_expr: {}}}: History from alive publisher {:?} not delivered ({} query(ies) pending, stalled={}), retrying historical query (backoff {:?})",
+                        states.key_expr,
+                        source_id,
+                        state.pending_queries,
+                        stalled,
+                        backoff
+                    );
+                    true
+                }
+            };
+            if flushed {
+                // Deliver what was staged, with the state lock released (#2744).
+                dispatch_outbox(&statesref);
+                return;
+            }
+            if retry_now {
+                query_source_history(&statesref, source_id, Some(HISTORY_RETRY_QUERY_TIMEOUT), Some(&history));
+                last_query = Instant::now();
+                wait = backoff;
+                backoff = (backoff * 2).min(HISTORY_RETRY_MAX);
+            } else {
+                wait = HISTORY_RETRY_POLL;
+            }
+        }
+    }))
+}
+
 fn periodic_query(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
+    query_source_history(statesref, source_id, None, None)
+}
+
+/// Query the undelivered historical samples of one sequenced source.
+///
+/// `timeout_override` replaces the configured `query_timeout` when set (used
+/// by the history retry so the loop always makes progress).
+fn query_source_history(
+    statesref: &Arc<Mutex<State>>,
+    source_id: EntityGlobalId,
+    timeout_override: Option<Duration>,
+    history: Option<&HistoryConfig>,
+) {
     let mut guard = statesref.lock().unwrap();
     let states = &mut *guard;
     // use peek_mut so query without samples do not prevent the state to be garbage collected
@@ -744,18 +1196,29 @@ fn periodic_query(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
         / &source_id.zid().into_keyexpr()
         / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
         / KE_STARSTAR;
-    let seq_num_range = seq_num_range(state.last_delivered.map(|s| s + 1), None);
+    let mut params = Parameters::from(seq_num_range(state.last_delivered.map(|s| s + 1), None));
+    if let Some(history) = history {
+        if let Some(max) = history.max_samples {
+            params.insert("_max", max.to_string());
+        }
+        if let Some(age) = history.max_age {
+            params.set_time_range(TimeRange {
+                start: TimeBound::Inclusive(TimeExpr::Now { offset_secs: -age }),
+                end: TimeBound::Unbounded,
+            });
+        }
+    }
 
     let session = states.session.clone();
     let key_expr = states.key_expr.clone().into_owned();
     let query_target = states.query_target;
-    let query_timeout = states.query_timeout;
+    let query_timeout = timeout_override.unwrap_or(states.query_timeout);
 
     tracing::trace!(
         "AdvancedSubscriber{{key_expr: {}}}: Querying undelivered samples {}?{}",
         states.key_expr,
         query_expr,
-        seq_num_range
+        params
     );
     drop(guard);
 
@@ -764,19 +1227,12 @@ fn periodic_query(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
         statesref: statesref.clone(),
     };
     let _ = session
-        .get(Selector::from((query_expr, seq_num_range)))
+        .get(Selector::from((query_expr, params)))
         .callback({
             move |r: Reply| {
                 if let Ok(s) = r.into_result() {
                     if key_expr.intersects(s.key_expr()) {
-                        let states = &mut *zlock!(handler.statesref);
-                        tracing::trace!(
-                            "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
-                            states.key_expr,
-                            s.source_info(),
-                            s.timestamp()
-                        );
-                        handle_sample(states, s);
+                        handle_reply_sample(&handler.statesref, s);
                     }
                 }
             }
@@ -883,6 +1339,9 @@ impl<Handler> AdvancedSubscriber<Handler> {
                 callback: Some(callback),
                 miss_handlers: HashMap::new(),
                 token: None,
+                outbox: VecDeque::new(),
+                delivering: None,
+                delivery_done: Arc::new(Condvar::new()),
                 _gc_task: AbortOnDropHandle::new(
                     ZRuntime::Application.spawn(gc_task(weak.clone(), retention_period)),
                 ),
@@ -895,62 +1354,71 @@ impl<Handler> AdvancedSubscriber<Handler> {
             let key_expr = key_expr.clone().into_owned();
 
             move |s: Sample| {
-                let mut lock = zlock!(statesref);
-                let states = &mut *lock;
-                let source_id = s.source_info().map(|si| *si.source_id());
-                let new = handle_sample(states, s);
+                // Stage under the lock; deliver after releasing it. Calling
+                // user code while holding `statesref` is what used to deadlock
+                // any callback that re-entered an `AdvancedSubscriber` API.
+                // Decided under the lock, issued once it is released.
+                let mut retransmission_query = None;
+                {
+                    let states = &mut *zlock!(statesref);
+                    let source_id = s.source_info().map(|si| *si.source_id());
+                    let new = handle_sample(states, s);
 
-                if let Some(source_id) = source_id {
-                    if let Some(state) = states.sequenced_states.get_mut(&source_id) {
-                        if new {
-                            state.periodic_task =
-                                spawn_periodic_queries(&statesref, states.period, source_id);
-                        }
-                        if retransmission.is_some()
-                            && state.pending_queries == 0
-                            && !state.pending_samples.is_empty()
-                        {
-                            state.pending_queries += 1;
-                            let query_expr = &key_expr
-                                / KE_ADV_PREFIX
-                                / KE_STAR
-                                / &source_id.zid().into_keyexpr()
-                                / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
-                                / KE_STARSTAR;
-                            let seq_num_range =
-                                seq_num_range(state.last_delivered.map(|s| s + 1), None);
-                            tracing::trace!(
-                                "AdvancedSubscriber{{key_expr: {}}}: Querying missing samples {}?{}",
-                                states.key_expr,
-                                query_expr,
-                                seq_num_range
-                            );
-                            drop(lock);
-                            let handler = SequencedRepliesHandler {
-                                source_id,
-                                statesref: statesref.clone(),
-                            };
-                            let _ = session
-                                .get(Selector::from((query_expr, seq_num_range)))
-                                .callback({
-                                    let key_expr = key_expr.clone().into_owned();
-                                    move |r: Reply| {
-                                        if let Ok(s) = r.into_result() {
-                                            if key_expr.intersects(s.key_expr()) {
-                                                let states = &mut *zlock!(handler.statesref);
-                                                tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                                handle_sample(states, s);
-                                            }
-                                        }
-                                    }
-                                })
-                                .consolidation(ConsolidationMode::None)
-                                .accept_replies(ReplyKeyExpr::Any)
-                                .target(query_target)
-                                .timeout(query_timeout)
-                                .wait();
+                    if let Some(source_id) = source_id {
+                        if let Some(state) = states.sequenced_states.get_mut(&source_id) {
+                            if new {
+                                state.periodic_task =
+                                    spawn_periodic_queries(&statesref, states.period, source_id);
+                            }
+                            if retransmission.is_some()
+                                && state.pending_queries == 0
+                                && !state.pending_samples.is_empty()
+                            {
+                                state.pending_queries += 1;
+                                let query_expr = &key_expr
+                                    / KE_ADV_PREFIX
+                                    / KE_STAR
+                                    / &source_id.zid().into_keyexpr()
+                                    / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
+                                    / KE_STARSTAR;
+                                let seq_num_range =
+                                    seq_num_range(state.last_delivered.map(|s| s + 1), None);
+                                tracing::trace!(
+                                    "AdvancedSubscriber{{key_expr: {}}}: Querying missing samples {}?{}",
+                                    states.key_expr,
+                                    query_expr,
+                                    seq_num_range
+                                );
+                                retransmission_query = Some((source_id, query_expr, seq_num_range));
+                            }
                         }
                     }
+                }
+                // Same order as before the refactor: deliver, then query.
+                dispatch_outbox(&statesref);
+
+                if let Some((source_id, query_expr, seq_num_range)) = retransmission_query {
+                    let handler = SequencedRepliesHandler {
+                        source_id,
+                        statesref: statesref.clone(),
+                    };
+                    let _ = session
+                        .get(Selector::from((query_expr, seq_num_range)))
+                        .callback({
+                            let key_expr = key_expr.clone().into_owned();
+                            move |r: Reply| {
+                                if let Ok(s) = r.into_result() {
+                                    if key_expr.intersects(s.key_expr()) {
+                                        handle_reply_sample(&handler.statesref, s);
+                                    }
+                                }
+                            }
+                        })
+                        .consolidation(ConsolidationMode::None)
+                        .accept_replies(ReplyKeyExpr::Any)
+                        .target(query_target)
+                        .timeout(query_timeout)
+                        .wait();
                 }
             }
         };
@@ -960,9 +1428,42 @@ impl<Handler> AdvancedSubscriber<Handler> {
         let drop_callback = {
             let statesref = statesref.clone();
             move || {
-                let mut states = statesref.lock().unwrap();
-                states.callback.take();
-                states.miss_handlers.clear();
+                // Deliberately does NOT drain the outbox itself. Every stage site
+                // dispatches on the way out, and each staged `Call` carries its
+                // own callback handle, so anything already queued has a thread on
+                // its way to deliver it. `wait_for_delivery` below waits for
+                // exactly that. Draining here would be redundant, and would put a
+                // user callback inside a `Drop` for no gain.
+                //
+                // Note this is not a rule the rest of the file follows: the four
+                // `*RepliesHandler::drop` impls do call `dispatch_outbox`, as they
+                // called user callbacks from their `Drop` before this change too.
+                // They have queued work of their own to flush; this one does not.
+                //
+                // Take the handles out under the lock and drop them outside it:
+                // dropping a user callback runs user `Drop` code, and that must
+                // not happen while `statesref` is held.
+                //
+                // Deliberately not `zlock!`: this closure runs inside
+                // `CallbackDrop`'s destructor, so unwrapping a poisoned mutex here
+                // is a panic in a `Drop`, which aborts. Recover the state instead —
+                // the handles still have to be released.
+                let (callback, miss_handlers) = {
+                    let states = &mut *match statesref.lock() {
+                        Ok(states) => states,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    (
+                        states.callback.take(),
+                        std::mem::take(&mut states.miss_handlers),
+                    )
+                };
+                // A delivery in flight holds its own clones and is still running
+                // user code; let it finish before releasing ours, so that
+                // undeclaring the subscriber still means "callbacks are done".
+                wait_for_delivery(&statesref);
+                drop(callback);
+                drop(miss_handlers);
             }
         };
 
@@ -1009,14 +1510,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                     move |r: Reply| {
                         if let Ok(s) = r.into_result() {
                             if key_expr.intersects(s.key_expr()) {
-                                let states = &mut *zlock!(handler.statesref);
-                                tracing::trace!(
-                                    "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
-                                    states.key_expr,
-                                    s.source_info(),
-                                    s.timestamp()
-                                );
-                                handle_sample(states, s);
+                                handle_reply_sample(&handler.statesref, s);
                             }
                         }
                     }
@@ -1105,10 +1599,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                         move |r: Reply| {
                                             if let Ok(s) = r.into_result() {
                                                 if key_expr.intersects(s.key_expr()) {
-                                                    let states =
-                                                        &mut *zlock!(handler.statesref);
-                                                    tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                                    handle_sample(states, s);
+                                                    handle_reply_sample(&handler.statesref, s);
                                                 }
                                             }
                                         }
@@ -1132,6 +1623,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                         states.sequenced_states.peek_mut(&source_id)
                                     {
                                         state.alive = false;
+                                        state.history_retry_task.take();
                                     }
                                     return;
                                 }
@@ -1152,6 +1644,25 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                         states.period,
                                         source_id,
                                     );
+                                    // The single history query below can be lost
+                                    // under churn; keep re-asking this alive
+                                    // publisher until something is delivered.
+                                    tracing::debug!(
+                                        "AdvancedSubscriber{{key_expr: {}}}: History-retry watchdog armed for publisher {:?}",
+                                        states.key_expr,
+                                        source_id
+                                    );
+                                }
+                                // A retained source may reappear after liveliness
+                                // loss; restart its retry task if it never delivered.
+                                if state.history_retry_task.is_none()
+                                    && state.last_delivered.is_none()
+                                {
+                                    state.history_retry_task = Some(spawn_history_retry(
+                                        &statesref,
+                                        source_id,
+                                        historyconf.clone(),
+                                    ));
                                 }
                                 state.pending_queries += 1;
                                 state.alive = true;
@@ -1188,9 +1699,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                         move |r: Reply| {
                                             if let Ok(s) = r.into_result() {
                                                 if key_expr.intersects(s.key_expr()) {
-                                                    let states = &mut *zlock!(handler.statesref);
-                                                    tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                                    handle_sample(states, s);
+                                                    handle_reply_sample(&handler.statesref, s);
                                                 }
                                             }
                                         }
@@ -1241,9 +1750,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                     move |r: Reply| {
                                         if let Ok(s) = r.into_result() {
                                             if key_expr.intersects(s.key_expr()) {
-                                                let states = &mut *zlock!(handler.statesref);
-                                                tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                                handle_sample(states, s);
+                                                handle_reply_sample(&handler.statesref, s);
                                             }
                                         }
                                     }
@@ -1362,9 +1869,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                 move |r: Reply| {
                                     if let Ok(s) = r.into_result() {
                                         if key_expr.intersects(s.key_expr()) {
-                                            let states = &mut *zlock!(handler.statesref);
-                                            tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                            handle_sample(states, s);
+                                            handle_reply_sample(&handler.statesref, s);
                                         }
                                     }
                                 }
@@ -1502,13 +2007,14 @@ impl<Handler> AdvancedSubscriber<Handler> {
 #[inline]
 fn flush_sequenced_source(
     state: &mut SourceState<WrappingSn>,
-    callback: Option<&Callback<Sample>>,
+    callback: &Callback<Sample>,
     source_id: &EntityGlobalId,
     miss_handlers: &HashMap<usize, Callback<Miss>>,
+    outbox: &mut VecDeque<Call>,
 ) {
-    let Some(callback) = callback else {
-        return;
-    };
+    // The caller has already established there is a callback. It is staged with
+    // each sample so that a sample which reached this point is delivered even if
+    // the subscriber is undeclared before the outbox is drained.
     if state.pending_queries == 0 && !state.pending_samples.is_empty() {
         let mut pending_samples = BTreeMap::new();
         std::mem::swap(&mut state.pending_samples, &mut pending_samples);
@@ -1516,11 +2022,11 @@ fn flush_sequenced_source(
             match state.last_delivered {
                 None => {
                     state.last_delivered = Some(seq_num);
-                    callback.call(sample);
+                    stage_sample(outbox, callback, sample);
                 }
                 Some(last) if seq_num == last + 1 => {
                     state.last_delivered = Some(seq_num);
-                    callback.call(sample);
+                    stage_sample(outbox, callback, sample);
                 }
                 Some(last) if seq_num > last + 1 => {
                     tracing::warn!(
@@ -1529,13 +2035,17 @@ fn flush_sequenced_source(
                         source_id,
                     );
                     for miss_callback in miss_handlers.values() {
-                        miss_callback.call(Miss {
-                            source: *source_id,
-                            nb: seq_num - last - 1,
-                        })
+                        stage_miss(
+                            outbox,
+                            miss_callback,
+                            Miss {
+                                source: *source_id,
+                                nb: seq_num - last - 1,
+                            },
+                        )
                     }
                     state.last_delivered = Some(seq_num);
-                    callback.call(sample);
+                    stage_sample(outbox, callback, sample);
                 }
                 _ => {
                     // duplicate
@@ -1549,11 +2059,12 @@ fn flush_sequenced_source(
 #[inline]
 fn flush_timestamped_source(
     state: &mut SourceState<Timestamp>,
-    callback: Option<&Callback<Sample>>,
+    callback: &Callback<Sample>,
+    outbox: &mut VecDeque<Call>,
 ) {
-    let Some(callback) = callback else {
-        return;
-    };
+    // The caller has already established there is a callback. It is staged with
+    // each sample so that a sample which reached this point is delivered even if
+    // the subscriber is undeclared before the outbox is drained.
     if state.pending_queries == 0 && !state.pending_samples.is_empty() {
         for (timestamp, sample) in std::mem::take(&mut state.pending_samples) {
             if state
@@ -1562,7 +2073,7 @@ fn flush_timestamped_source(
                 .unwrap_or(true)
             {
                 state.last_delivered = Some(timestamp);
-                callback.call(sample);
+                stage_sample(outbox, callback, sample);
             }
         }
     }
@@ -1577,28 +2088,40 @@ struct InitialRepliesHandler {
 #[zenoh_macros::unstable]
 impl Drop for InitialRepliesHandler {
     fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        states.global_pending_queries = states.global_pending_queries.saturating_sub(1);
-        tracing::trace!(
-            "AdvancedSubscriber{{key_expr: {}}}: Flush initial replies",
-            states.key_expr
-        );
+        {
+            let states = &mut *zlock!(self.statesref);
+            states.global_pending_queries = states.global_pending_queries.saturating_sub(1);
+            tracing::trace!(
+                "AdvancedSubscriber{{key_expr: {}}}: Flush initial replies",
+                states.key_expr
+            );
 
-        if states.global_pending_queries == 0 {
-            for (source_id, state) in states.sequenced_states.iter_mut() {
-                flush_sequenced_source(
-                    state,
-                    states.callback.as_ref(),
-                    source_id,
-                    &states.miss_handlers,
-                );
-                state.periodic_task =
-                    spawn_periodic_queries(&self.statesref, states.period, *source_id);
-            }
-            for (_, state) in states.timestamped_states.iter_mut() {
-                flush_timestamped_source(state, states.callback.as_ref());
+            if states.global_pending_queries == 0 {
+                // Owned, so it does not borrow `states` across the flushes. The
+                // periodic queries are respawned whether or not a callback is
+                // registered, as before — only the flushing is conditional.
+                let callback = states.callback.clone();
+                for (source_id, state) in states.sequenced_states.iter_mut() {
+                    if let Some(callback) = callback.as_ref() {
+                        flush_sequenced_source(
+                            state,
+                            callback,
+                            source_id,
+                            &states.miss_handlers,
+                            &mut states.outbox,
+                        );
+                    }
+                    state.periodic_task =
+                        spawn_periodic_queries(&self.statesref, states.period, *source_id);
+                }
+                if let Some(callback) = callback.as_ref() {
+                    for (_, state) in states.timestamped_states.iter_mut() {
+                        flush_timestamped_source(state, callback, &mut states.outbox);
+                    }
+                }
             }
         }
+        dispatch_outbox(&self.statesref);
     }
 }
 
@@ -1612,23 +2135,30 @@ struct SequencedRepliesHandler {
 #[zenoh_macros::unstable]
 impl Drop for SequencedRepliesHandler {
     fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        // use peek_mut so query without samples do not prevent the state to be garbage collected
-        if let Some(state) = states.sequenced_states.peek_mut(&self.source_id) {
-            state.pending_queries = state.pending_queries.saturating_sub(1);
-            if states.global_pending_queries == 0 {
-                tracing::trace!(
-                    "AdvancedSubscriber{{key_expr: {}}}: Flush sequenced samples",
-                    states.key_expr
-                );
-                flush_sequenced_source(
-                    state,
-                    states.callback.as_ref(),
-                    &self.source_id,
-                    &states.miss_handlers,
-                )
+        {
+            let states = &mut *zlock!(self.statesref);
+            let callback = states.callback.clone();
+            // use peek_mut so query without samples do not prevent the state to be garbage collected
+            if let Some(state) = states.sequenced_states.peek_mut(&self.source_id) {
+                state.pending_queries = state.pending_queries.saturating_sub(1);
+                if states.global_pending_queries == 0 {
+                    tracing::trace!(
+                        "AdvancedSubscriber{{key_expr: {}}}: Flush sequenced samples",
+                        states.key_expr
+                    );
+                    if let Some(callback) = callback.as_ref() {
+                        flush_sequenced_source(
+                            state,
+                            callback,
+                            &self.source_id,
+                            &states.miss_handlers,
+                            &mut states.outbox,
+                        )
+                    }
+                }
             }
         }
+        dispatch_outbox(&self.statesref);
     }
 }
 
@@ -1642,18 +2172,24 @@ struct TimestampedRepliesHandler {
 #[zenoh_macros::unstable]
 impl Drop for TimestampedRepliesHandler {
     fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        // use peek_mut so query without samples do not prevent the state to be garbage collected
-        if let Some(state) = states.timestamped_states.peek_mut(&self.id) {
-            state.pending_queries = state.pending_queries.saturating_sub(1);
-            if states.global_pending_queries == 0 {
-                tracing::trace!(
-                    "AdvancedSubscriber{{key_expr: {}}}: Flush timestamped samples",
-                    states.key_expr
-                );
-                flush_timestamped_source(state, states.callback.as_ref());
+        {
+            let states = &mut *zlock!(self.statesref);
+            let callback = states.callback.clone();
+            // use peek_mut so query without samples do not prevent the state to be garbage collected
+            if let Some(state) = states.timestamped_states.peek_mut(&self.id) {
+                state.pending_queries = state.pending_queries.saturating_sub(1);
+                if states.global_pending_queries == 0 {
+                    tracing::trace!(
+                        "AdvancedSubscriber{{key_expr: {}}}: Flush timestamped samples",
+                        states.key_expr
+                    );
+                    if let Some(callback) = callback.as_ref() {
+                        flush_timestamped_source(state, callback, &mut states.outbox);
+                    }
+                }
             }
         }
+        dispatch_outbox(&self.statesref);
     }
 }
 
@@ -1716,13 +2252,19 @@ impl<Handler> SampleMissListener<Handler> {
     where
         Handler: Send,
     {
-        SampleMissHandlerUndeclaration { listener: self }
+        SampleMissHandlerUndeclaration {
+            listener: self,
+            wait_callbacks: false,
+        }
     }
 
     fn undeclare_impl(&mut self) -> ZResult<()> {
         // set the flag first to avoid double panic if this function panic
         self.undeclare_on_drop = false;
-        zlock!(self.statesref).unregister_miss_callback(&self.id);
+        // The guard is a temporary and is released at the end of this statement,
+        // so `callback` — whose `Drop` is user code — is dropped unlocked below.
+        let callback = zlock!(self.statesref).unregister_miss_callback(&self.id);
+        drop(callback);
         Ok(())
     }
 
@@ -1771,6 +2313,7 @@ impl<Handler> std::ops::DerefMut for SampleMissListener<Handler> {
 #[zenoh_macros::unstable]
 pub struct SampleMissHandlerUndeclaration<Handler> {
     listener: SampleMissListener<Handler>,
+    wait_callbacks: bool,
 }
 
 #[zenoh_macros::unstable]
@@ -1784,9 +2327,24 @@ impl<Handler> fmt::Debug for SampleMissHandlerUndeclaration<Handler> {
 
 impl<Handler> SampleMissHandlerUndeclaration<Handler> {
     /// Block in undeclare operation until all currently running instances of sample miss listener callback (if any) return.
-    pub fn wait_callbacks(self) -> Self {
-        // Note: no particular synchronization is required as of now since miss listener callbacks are always executed
-        // under state lock
+    ///
+    /// The wait covers a miss report that has already been staged for delivery,
+    /// not only one whose callback is running at this instant. Both are calls the
+    /// subscriber has committed to and neither is cancelled by undeclaring.
+    ///
+    /// It is subscriber-wide: a sample callback in flight is waited out too. The
+    /// staged calls share one queue, so a listener's own cannot be waited for in
+    /// isolation.
+    ///
+    /// Calling this from inside a callback that is itself being delivered does
+    /// not deadlock — see `wait_for_delivery`.
+    pub fn wait_callbacks(mut self) -> Self {
+        // This used to be a no-op, on the stated grounds that "miss listener
+        // callbacks are always executed under state lock" — so acquiring that
+        // lock during undeclare was itself the wait. Callbacks are no longer
+        // invoked under the lock (that is what made them able to deadlock), so
+        // the wait is now explicit. See `wait_for_delivery`.
+        self.wait_callbacks = true;
         self
     }
 }
@@ -1799,7 +2357,14 @@ impl<Handler> Resolvable for SampleMissHandlerUndeclaration<Handler> {
 #[zenoh_macros::unstable]
 impl<Handler> Wait for SampleMissHandlerUndeclaration<Handler> {
     fn wait(mut self) -> <Self as Resolvable>::To {
-        self.listener.undeclare_impl()
+        let statesref = self.listener.statesref.clone();
+        self.listener.undeclare_impl()?;
+        if self.wait_callbacks {
+            // Unregistering drops our handle, but a delivery already in flight
+            // holds its own clone and is still running the callback. Wait for it.
+            wait_for_delivery(&statesref);
+        }
+        Ok(())
     }
 }
 

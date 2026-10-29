@@ -11,9 +11,12 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(test)]
+use std::borrow::Cow;
+
 use std::{
     any::Any,
-    borrow::{Borrow, Cow},
+    borrow::Borrow,
     collections::VecDeque,
     convert::TryInto,
     fmt::Debug,
@@ -27,7 +30,10 @@ use zenoh_protocol::{
     core::{key_expr::keyexpr, ExprId, Region, WireExpr},
     network::{
         self,
-        declare::{self, queryable::ext::QueryableInfoType, Declare, DeclareBody, DeclareKeyExpr},
+        declare::{
+            self, queryable::ext::QueryableInfoType, Declare, DeclareBody, DeclareKeyExpr,
+            UndeclareKeyExpr,
+        },
         interest::InterestId,
         Mapping, RequestId,
     },
@@ -189,8 +195,6 @@ pub(crate) struct FaceContext {
     pub(crate) subs: Option<SubscriberInfo>,
     pub(crate) qabl: Option<QueryableInfoType>,
     pub(crate) token: bool,
-    pub(crate) subscriber_interest_finalized: bool,
-    pub(crate) queryable_interest_finalized: bool,
     pub(crate) in_interceptor_cache: InterceptorCache,
     pub(crate) e_interceptor_cache: InterceptorCache,
 }
@@ -204,8 +208,6 @@ impl FaceContext {
             subs: None,
             qabl: None,
             token: false,
-            subscriber_interest_finalized: false,
-            queryable_interest_finalized: false,
             in_interceptor_cache: InterceptorCache::empty(),
             e_interceptor_cache: InterceptorCache::empty(),
         }
@@ -537,6 +539,9 @@ impl Resource {
         let mutres = get_mut_unchecked(&mut resclone);
         if let Some(ref mut parent) = mutres.parent {
             tracing::trace!(strong_count = Arc::strong_count(res));
+            if res.children.is_empty() {
+                Resource::release_unused_local_expr_ids(res);
+            }
             if Arc::strong_count(res) <= 3 && res.children.is_empty() {
                 // consider only childless resource held by only one external object (+ 1 strong count for resclone, + 1 strong count for res.parent to a total of 3 )
                 tracing::debug!("Unregister resource {}", res.expr());
@@ -557,6 +562,40 @@ impl Resource {
                     get_mut_unchecked(parent).children.remove(res.suffix());
                 }
                 Resource::clean(parent);
+            }
+        }
+    }
+
+    /// Releases the ids this node declared for `res` to its faces when those mappings are the
+    /// only remaining holders of `res` besides the caller, `clean`'s clone and the parent, and
+    /// sends `UndeclareKeyExpr` to each face so the remote releases them too.
+    fn release_unused_local_expr_ids(res: &mut Arc<Resource>) {
+        let mapped: Vec<(Arc<FaceState>, ExprId)> = res
+            .face_ctxs
+            .values()
+            .filter_map(|ctx| ctx.local_expr_id.map(|id| (ctx.face.clone(), id)))
+            .collect();
+        if mapped.is_empty() || Arc::strong_count(res) > 3 + mapped.len() {
+            return;
+        }
+        for (mut face, id) in mapped {
+            if let Some(ctx) = get_mut_unchecked(res).face_ctxs.get_mut(&face.id) {
+                get_mut_unchecked(ctx).local_expr_id = None;
+            }
+            if get_mut_unchecked(&mut face)
+                .release_local_expr_id(id)
+                .is_some()
+            {
+                face.primitives.send_declare(RoutingContext::with_expr(
+                    &mut Declare {
+                        interest_id: None,
+                        ext_qos: declare::ext::QoSType::DECLARE,
+                        ext_tstamp: None,
+                        ext_nodeid: declare::ext::NodeIdType::DEFAULT,
+                        body: DeclareBody::UndeclareKeyExpr(UndeclareKeyExpr { id }),
+                    },
+                    res.expr().to_string(),
+                ));
             }
         }
     }
@@ -691,11 +730,13 @@ impl Resource {
                             .unwrap_or(true)
                     })
                 {
+                    let Some(expr_id) = get_mut_unchecked(face).next_local_expr_id() else {
+                        return res.expr().to_string().into();
+                    };
                     let ctx = get_mut_unchecked(&mut nonwild_prefix)
                         .face_ctxs
                         .entry(face.id)
                         .or_insert_with(|| Arc::new(FaceContext::new(face.clone())));
-                    let expr_id = face.get_next_local_id();
                     get_mut_unchecked(ctx).local_expr_id = Some(expr_id);
                     get_mut_unchecked(face)
                         .local_mappings
@@ -736,16 +777,36 @@ impl Resource {
     /// If none is found, and if the tested resource itself doesn't have a declared keyexpr,
     /// then the parent tree is walked through. If there is still no declared keyexpr, the whole
     /// prefix+suffix string is used.
+    #[cfg(test)]
     pub fn get_best_key<'a>(&self, suffix: &'a str, sid: usize) -> WireExpr<'a> {
+        self.get_best_key_with_receiver(suffix, sid, true)
+    }
+
+    /// Routed messages outlive the table read lock. Either endpoint can retire
+    /// a mapping before the message is enqueued, so keep the full expression.
+    /// Compression requires a mapping lease spanning route selection through
+    /// transport enqueue; cached Direction values currently hold no such lease.
+    pub fn get_best_sender_key<'a>(&self, suffix: &'a str, _sid: usize) -> WireExpr<'a> {
+        [&self.expr, suffix].concat().into()
+    }
+
+    #[cfg(test)]
+    fn get_best_key_with_receiver<'a>(
+        &self,
+        suffix: &'a str,
+        sid: usize,
+        allow_receiver: bool,
+    ) -> WireExpr<'a> {
         /// Retrieve a declared keyexpr, either local or remote.
         fn get_wire_expr<'a>(
             prefix: &Resource,
             suffix: impl FnOnce() -> Cow<'a, str>,
             sid: usize,
+            allow_receiver: bool,
         ) -> Option<WireExpr<'a>> {
             let ctx = prefix.face_ctxs.get(&sid)?;
             let (scope, mapping) = match (ctx.remote_expr_id, ctx.local_expr_id) {
-                (Some(expr_id), _) => (expr_id, Mapping::Receiver),
+                (Some(expr_id), _) if allow_receiver => (expr_id, Mapping::Receiver),
                 (_, Some(expr_id)) => (expr_id, Mapping::Sender),
                 _ => return None,
             };
@@ -760,6 +821,7 @@ impl Resource {
             mut prefix: &Resource,
             suffix: &'a str,
             sid: usize,
+            allow_receiver: bool,
         ) -> Option<WireExpr<'a>> {
             let mut suffix_rest = suffix;
             // do not use recursion as the tree may have arbitrary depth
@@ -773,7 +835,9 @@ impl Resource {
             }
             // then we go backward checking the child and its parents
             while suffix_rest != suffix {
-                if let Some(wire_expr) = get_wire_expr(prefix, || suffix_rest.into(), sid) {
+                if let Some(wire_expr) =
+                    get_wire_expr(prefix, || suffix_rest.into(), sid, allow_receiver)
+                {
                     return Some(wire_expr);
                 }
                 suffix_rest = &suffix[suffix.len() - suffix_rest.len() - prefix.suffix().len()..];
@@ -787,11 +851,12 @@ impl Resource {
             suffix: &'a str,
             sid: usize,
             mut parent: &Resource,
+            allow_receiver: bool,
         ) -> Option<WireExpr<'a>> {
             // do not use recursion as the tree may have arbitrary depth
             loop {
                 let parent_suffix = || [&prefix.expr[parent.expr.len()..], suffix].concat().into();
-                if let Some(wire_expr) = get_wire_expr(parent, parent_suffix, sid) {
+                if let Some(wire_expr) = get_wire_expr(parent, parent_suffix, sid, allow_receiver) {
                     return Some(wire_expr);
                 }
                 {
@@ -800,9 +865,11 @@ impl Resource {
                 }
             }
         }
-        get_best_child_key(self, suffix, sid)
-            .or_else(|| get_wire_expr(self, || suffix.into(), sid))
-            .or_else(|| get_best_parent_key(self, suffix, sid, self.parent.as_ref()?))
+        get_best_child_key(self, suffix, sid, allow_receiver)
+            .or_else(|| get_wire_expr(self, || suffix.into(), sid, allow_receiver))
+            .or_else(|| {
+                get_best_parent_key(self, suffix, sid, self.parent.as_ref()?, allow_receiver)
+            })
             .unwrap_or_else(|| [&self.expr, suffix].concat().into())
     }
 
